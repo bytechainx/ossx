@@ -25,7 +25,7 @@
 //! // TDD-PROBE: OssError::is_retryable | 变异：鉴权失败降级也被判可重试 | 红=error_is_retryable_by_classification | 绿=error_is_retryable_by_classification
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -80,28 +80,61 @@ fn base_builder() -> ossx::OssConfigBuilder {
 /// 起一个本地一次性 HTTP 服务，最多处理 `connections` 个请求，返回 `http://localhost:<port>`。
 ///
 /// 客户端使用 OSS 虚拟主机风格（`{bucket}.{host}`），IP endpoint 会被拒绝，
-/// 因此这里绑定 IPv6 回环：`{bucket}.localhost` 在本机解析到 `::1`。
+/// 因此 endpoint 的 host 必须是一个**可解析名**（这里是 `localhost`）——
+/// **绑定的地址家族必须跟随解析结果，不能硬编码**：
+/// 2026-09-22 实测本机 `getent hosts localhost` 给出 `::1`，而 `getaddrinfo`
+/// （`std::net::ToSocketAddrs` 走的也是它）只给出 `127.0.0.1`，两套工具不一致；
+/// 旧实现硬编码绑 `[::1]`，等于把可用性押在客户端栈的隐式回退上。
+///
+/// 现实现：解析 `localhost` → 绑第一个地址 → 在其余地址上补绑**同一端口**（失败不致命），
+/// 并把「解析列表 / 实际绑定地址」写进 panic 消息，使失败可直接指向根因。
 /// 服务线程随句柄被丢弃而分离；进程退出时自然结束，不阻塞用例。
 fn serve(status_line: &'static str, body: &'static str, connections: usize) -> String {
-    let listener = TcpListener::bind("[::1]:0").expect("绑定本地 IPv6 回环端口必须成功");
-    let addr = listener.local_addr().expect("读取本地地址");
-    let _server = std::thread::spawn(move || {
-        for _ in 0..connections {
-            let Ok((mut stream, _)) = listener.accept() else {
-                break;
-            };
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-            let mut buffer = [0_u8; 2048];
-            let _ = stream.read(&mut buffer);
-            let response = format!(
-                "{status_line}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
+    let resolved: Vec<SocketAddr> = ("localhost", 0)
+        .to_socket_addrs()
+        .expect("localhost 必须可解析（本地联调前提）")
+        .collect();
+    assert!(
+        !resolved.is_empty(),
+        "localhost 必须解析出至少一个地址（本地联调前提）"
+    );
+
+    let first = resolved[0];
+    let listener = TcpListener::bind(first)
+        .unwrap_or_else(|error| panic!("绑定 {first} 失败（解析列表：{resolved:?}）：{error}"));
+    let port = listener.local_addr().expect("读取本地地址").port();
+
+    // 其余解析地址上补绑同一端口：覆盖「客户端解析顺序与 bind 尝试顺序不一致」的情形。
+    // 失败不致命（端口可能已被占用，或该家族不可用），仅用于提高稳定性。
+    let mut listeners = vec![listener];
+    for addr in resolved.iter().skip(1) {
+        let mut with_port = *addr;
+        with_port.set_port(port);
+        if let Ok(extra) = TcpListener::bind(with_port) {
+            listeners.push(extra);
         }
-    });
-    format!("http://localhost:{}", addr.port())
+    }
+
+    for listener in listeners {
+        let _server = std::thread::spawn(move || {
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let response = format!(
+                    "{status_line}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+    }
+
+    format!("http://localhost:{port}")
 }
 
 /// loopback HTTP 是唯一允许的明文端点（本地开发；IP endpoint 不支持虚拟主机风格）。
