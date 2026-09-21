@@ -4,10 +4,45 @@
 //! 单元测试以固定 secret / date 断言 HMAC-SHA1 摘要（见 `tests/sign_pure.rs`）。
 
 use base64::Engine;
+use hmac::digest::Key;
 use hmac::{Hmac, Mac};
-use sha1::Sha1;
+use sha1::{Digest, Sha1};
 
 type HmacSha1 = Hmac<Sha1>;
+
+/// SHA-1 的分组大小（字节），也是 HMAC 密钥规整后的目标长度。
+const SHA1_BLOCK_BYTES: usize = 64;
+
+/// 按 RFC 2104 §2 把 HMAC 密钥规整为恰好一个分组。
+///
+/// - 密钥长于分组：先取 `SHA-1(key)`，再左补零；
+/// - 否则：直接左补零。
+///
+/// 显式做这一步是为了让后续构造走**不可失败**的 [`Mac::new`]（取定长密钥），从而
+/// 在签名路径上彻底消除 `Result` 与 `panic` 两种分支——早先的实现在理论上不可达的
+/// 失败路径上直接 `expect`，虽然不会触发，但那是一条真实存在的 panic 分支。
+///
+/// 该规则与 `hmac` crate 内部的 `get_der_key` 一致，并由差分测试
+/// `hmac_sha1_matches_hmac_crate_across_key_lengths` 逐字节验证。
+fn derive_key_block(key: &[u8]) -> [u8; SHA1_BLOCK_BYTES] {
+    let mut block = [0_u8; SHA1_BLOCK_BYTES];
+    if key.len() > SHA1_BLOCK_BYTES {
+        // SHA-1 输出恒为 20 字节，短于 64 字节分组，故此切片不会越界。
+        let digest = Sha1::digest(key);
+        block[..digest.len()].copy_from_slice(&digest);
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    block
+}
+
+/// HMAC-SHA1 摘要（20 字节）。
+fn hmac_sha1(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    let key_block: Key<HmacSha1> = derive_key_block(key).into();
+    let mut mac = <HmacSha1 as Mac>::new(&key_block);
+    mac.update(msg);
+    mac.finalize().into_bytes().to_vec()
+}
 
 /// 构造 StringToSign 并 HMAC-SHA1 + Base64。
 ///
@@ -51,13 +86,8 @@ pub fn sign_v1(
     let string_to_sign = format!(
         "{verb}\n{content_md5}\n{content_type}\n{date}\n{canonicalized_oss_headers}{canonicalized_resource}"
     );
-    // 不变量：HMAC 接受任意长度密钥（`new_from_slice` 的 Result 仅为 API 统一性），
-    // 此处必然成功；失败即程序 bug。
-    #[allow(clippy::expect_used)]
-    let mut mac =
-        HmacSha1::new_from_slice(secret.as_bytes()).expect("HMAC-SHA1 accepts any key length");
-    mac.update(string_to_sign.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+    let digest = hmac_sha1(secret.as_bytes(), string_to_sign.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(digest)
 }
 
 /// `Authorization: OSS <AccessKeyId>:<Signature>`。
@@ -201,8 +231,11 @@ mod tests {
         );
     }
 
-    /// 不变量：HMAC-SHA1 接受**任意长度**密钥，因此 `sign_v1` 内的
-    /// `expect` 不可能触发。这里用空密钥与超长密钥的固定向量锁定该前提。
+    /// 经公开入口 `sign_v1` 锁定空密钥与超长密钥的行为。
+    ///
+    /// 这两条路径原先用于论证 `sign_v1` 内 `expect` 不可达；该 `expect` 已被零 panic
+    /// 实现取代（见 [`derive_key_block`]），但这组向量仍然有价值：它从**公开 API**
+    /// 侧钉住密钥规整的两个分支，与下面的差分测试互为补充。
     #[test]
     fn hmac_accepts_any_key_length() {
         assert_eq!(
@@ -213,6 +246,82 @@ mod tests {
             sign_v1(&"k".repeat(200), "GET", "", "", "0", "", "/b/k"),
             "qD+QtQV2jO7MIau5+WtM5Nmk6RE="
         );
+    }
+
+    /// 把字节串渲染为小写十六进制（仅测试使用，避免为断言引入额外依赖）。
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// RFC 2202 的权威向量，覆盖**密钥长度**的各个分支：短于分组（左补零）、
+    /// 恰等于分组（64 字节，不哈希）、超过分组（先哈希）。
+    #[test]
+    fn hmac_sha1_matches_rfc2202_vectors_across_key_lengths() {
+        // TC1：20 字节密钥，短于分组。
+        assert_eq!(
+            to_hex(&hmac_sha1(&[0x0b; 20], b"Hi There")),
+            "b617318655057264e28bc0b6fb378c8ef146be00"
+        );
+        // TC2：`Jefe`。
+        assert_eq!(
+            to_hex(&hmac_sha1(b"Jefe", b"what do ya want for nothing?")),
+            "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"
+        );
+        // TC6：80 字节密钥（> 64 字节分组，必须先哈希）。
+        let long_key = [0xaa_u8; 80];
+        assert_eq!(
+            to_hex(&hmac_sha1(
+                &long_key,
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "aa4ae5e15272d00e95705637ce8a3b55ed402112"
+        );
+        // TC7：超长密钥 + 超长消息。
+        assert_eq!(
+            to_hex(&hmac_sha1(
+                &long_key,
+                b"Test Using Larger Than Block-Size Key and Larger Than One Block-Size Data"
+            )),
+            "e8e99d0f45237d786d6bbaa7965c7808bbff1a91"
+        );
+        // 空密钥 + 空消息：仍须是合法的 20 字节摘要，而不是任何形式的空值。
+        assert_eq!(
+            to_hex(&hmac_sha1(b"", b"")),
+            "fbdb1d1b18aa6c08324b7d64b71fb76370690e1d"
+        );
+        // 分组边界：64 字节不哈希、65 字节先哈希。
+        assert_eq!(
+            to_hex(&hmac_sha1(&[0_u8; 64], b"msg")),
+            "1df552b90836e9881b1873998715838bf13ae65e"
+        );
+        assert_eq!(
+            to_hex(&hmac_sha1(&[0_u8; 65], b"msg")),
+            "1aa547ff99ed84e61a2a906b907cbfd8d6843ce4"
+        );
+    }
+
+    /// 差分测试：自实现的密钥规整必须与 `hmac` crate 的 `new_from_slice` 路径
+    /// 在全部密钥长度分支上逐字节一致。
+    ///
+    /// 这是「自行规整 + 不可失败构造」方案的**正确性依据**：`derive_key_block` 一旦
+    /// 与 crate 内部规则出现偏差（例如长密钥少哈希一次、补零位置写错），本用例会
+    /// 立即失败，而不会退化成线上难以定位的签名错误。
+    ///
+    /// 参考实现只在本测试中使用；生产路径不含任何可失败分支。
+    #[test]
+    fn hmac_sha1_matches_hmac_crate_across_key_lengths() {
+        for len in [0, 1, 19, 20, 21, 63, 64, 65, 100, 200, 1_000] {
+            let key = vec![0x5a_u8; len];
+            let msg = b"differential check";
+            let mut reference = <HmacSha1 as Mac>::new_from_slice(&key)
+                .expect("HMAC 接受任意长度密钥，参考实现不会失败");
+            reference.update(msg);
+            assert_eq!(
+                hmac_sha1(&key, msg),
+                reference.finalize().into_bytes().to_vec(),
+                "密钥长度 {len} 的实现与 hmac crate 不一致"
+            );
+        }
     }
 
     #[test]
