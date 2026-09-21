@@ -151,6 +151,30 @@ impl DownloadOptions {
     }
 }
 
+/// 健康检查结果。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OssHealth {
+    /// 是否可用（bucket 可访问）。
+    pub ready: bool,
+    /// bucket 是否可访问。
+    pub bucket_accessible: bool,
+    /// 探活耗时（毫秒）。
+    pub latency_ms: u64,
+    /// 人类可读细节（不含凭据）。
+    pub detail: String,
+}
+
+impl OssHealth {
+    pub(super) fn unreachable(latency_ms: u64, detail: impl Into<String>) -> Self {
+        Self {
+            ready: false,
+            bucket_accessible: false,
+            latency_ms,
+            detail: detail.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
