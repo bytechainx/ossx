@@ -120,6 +120,8 @@ pub fn canonicalized_resource(bucket: &str, object_key: &str) -> String {
 /// - complete/abort：`[("uploadId", Some(id))]`
 /// - list 翻页：`[("continuation-token", Some(token))]`（该子资源参与签名）
 ///
+/// # Examples
+///
 /// ```
 /// use ossx::canonicalized_resource_with_subresources;
 ///
