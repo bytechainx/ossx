@@ -15,7 +15,12 @@ include = [
     "src/**/*",
     "tests/**/*",
     "examples/**/*",
+    "benches/**/*",
+    "docs/**/*",
     "README.md",
+    "CHANGELOG.md",
+    "CONTEXT.md",
+    "CONTRIBUTING.md",
     "LICENSE-*",
     "Cargo.toml",
 ]
@@ -39,3 +44,20 @@ url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[[bench]]
+name = "hot_path"
+harness = false
+
+[lints.rust]
+private_interfaces = "deny"
+private_bounds = "deny"
+unused_must_use = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"

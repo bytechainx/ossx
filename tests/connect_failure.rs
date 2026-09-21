@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
 //! 失败路径：不可达 endpoint 下 `ping` / 数据面操作必须返回 `Err`，且健康检查
 //! 必须以结构化结果表达「不可用」，绝不静默成功。
 //!

@@ -62,6 +62,15 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(unreachable_pub)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 
 mod client;
 mod config;

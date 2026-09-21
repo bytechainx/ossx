@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
 //! 配置校验、环境变量装载、硬上限与 secret 脱敏。
 
 use std::sync::{Mutex, MutexGuard};
