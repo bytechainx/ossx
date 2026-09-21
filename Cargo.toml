@@ -1,0 +1,45 @@
+[package]
+name = "ossx"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Aliyun OSS adapter: Signature V1, streaming, multipart upload and presigned URLs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bytechainx/ossx"
+homepage = "https://github.com/bytechainx/ossx"
+documentation = "https://docs.rs/ossx"
+readme = "README.md"
+keywords = ["oss", "aliyun", "object-storage", "s3", "async"]
+categories = ["network-programming", "filesystem"]
+include = [
+    "src/**/*",
+    "tests/**/*",
+    "examples/**/*",
+    "README.md",
+    "LICENSE-*",
+    "Cargo.toml",
+]
+
+[dependencies]
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures-core = "0.3"
+futures-util = "0.3"
+hmac = "0.12"
+quick-xml = "0.41"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+sha1 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+toml = "0.8"
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
