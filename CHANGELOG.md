@@ -8,6 +8,13 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 三类测试（特性 002）：`tests/tdd_contracts.rs`（逐公开入口的行为契约与变异探测红绿，
+  数据面入口由本地一次性 TCP 服务驱动）、`tests/sdd_spec.rs`（与 `docs/标准.md` 章节 1:1
+  的规格断言）、`tests/aidd_boundary.rs`（凭据脱敏 / 明文 HTTP / 对象键 / 资源上界 /
+  鉴权降级等对抗用例）；均为离线用例，不依赖真实 OSS，也不引入 `#[ignore]`。
+
 ## [0.1.0] - 2026-09-21
 
 ### 新增
