@@ -3,8 +3,7 @@
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 阿里云 OSS（对象存储）异步适配器。基于 `reqwest` + **OSS Signature V1**，覆盖对象读写、
-流式传输、分片上传、预签名 URL、可刷新凭据与连接池统计；零内部框架依赖，可直接
-`cargo publish`。
+流式传输、分片上传、预签名 URL、可刷新凭据与连接池统计；零内部框架依赖。
 
 ## 特性
 
@@ -16,17 +15,15 @@
 - **凭据**：`CredentialProvider` 每次请求取一次凭据，天然支持 STS / 自建凭据服务轮换
 - **治理**：并发信号量、单请求超时、整操作 deadline、指数退避 + 抖动重试、资源硬上限
 - **安全**：`Debug` 与错误消息均不回显 `AccessKeySecret`；远程 endpoint 强制 HTTPS
-- **可独立发布**：零内部框架依赖（无 `kernel` / `resiliencx` 等），全部走 crates.io 公开依赖
+- **零内部耦合**：不依赖 `kernel` / `resiliencx` 等内部框架，全部走 crates.io 公开依赖
 
 ## 安装
 
-```bash
-cargo add ossx
-```
+本 crate **不发布到 crates.io**，通过 git 依赖引入：
 
 ```toml
 [dependencies]
-ossx = "0.1"
+ossx = { git = "https://github.com/bytechainx/ossx" }
 ```
 
 ## 最小可运行示例

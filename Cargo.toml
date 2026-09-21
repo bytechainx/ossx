@@ -7,7 +7,7 @@ description = "Aliyun OSS adapter: Signature V1, streaming, multipart upload and
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bytechainx/ossx"
 homepage = "https://github.com/bytechainx/ossx"
-documentation = "https://docs.rs/ossx"
+documentation = "https://github.com/bytechainx/ossx#readme"
 readme = "README.md"
 keywords = ["oss", "aliyun", "object-storage", "s3", "async"]
 categories = ["network-programming", "filesystem"]
@@ -39,7 +39,3 @@ url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
