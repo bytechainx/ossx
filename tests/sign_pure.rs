@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
 //! 纯函数行为回归：签名向量、CanonicalizedResource、分片、key 校验、重试判定。
 //!
 //! 签名摘要是协议正确性的关键：本文件用固定 `secret` / `date` 断言 HMAC-SHA1

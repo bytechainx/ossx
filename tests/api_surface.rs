@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable
+)]
 //! 公共 API 表面回归：导出项存在、可用，且公开类型满足 `Send + Sync`。
 
 use std::sync::Arc;
