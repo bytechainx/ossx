@@ -8,6 +8,33 @@
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-22
+
+### 变更
+
+- **内部结构改写（公开 API 与可观察契约均不变）**：按 `docs/module-rules.md` §5.5 的手法，把
+  `src/client/multipart.rs` 的两个方法组下沉为子模块 —— 分片上传的会话面
+  （`initiate_multipart*` / `upload_part*`）→ `src/client/multipart/session.rs`（200 行）；
+  收口面（`complete_multipart*` / `abort_multipart*`）→ `src/client/multipart/commit.rs`
+  （187 行）。门面 `src/client/multipart.rs` 保留模块文档、`put_object_multipart` 批量编排、
+  `cleanup_multipart_failure` 与孤儿审计注册表（`register_orphan_audit` /
+  `remove_orphan_audit`）。
+  `impl OssClient` 现跨三个文件（Rust 允许同一类型的多个 impl 块），五个公开入口
+  （`initiate_multipart` / `upload_part` / `complete_multipart` / `abort_multipart` /
+  `put_object_multipart`）**签名与路径一字未改**。
+  五处可见性放宽（均为 `pub(super)`，均因「父/兄弟模块互相看不到私有项」）：
+  门面调用的四个 `*_with_deadline`，以及被 `commit.rs` 调用的门面私有辅助
+  `remove_orphan_audit`；同组的四个 `*_once` 只在本模块内被调用，**保持私有**。
+  `src/client/multipart.rs` 生产段 **548 → 190** 行（该文件本就没有内联测试段，
+  故生产段等于总行数）。
+  动机：`module-rules` 是元仓库必需检查，且它审计各仓**默认分支**，故当 `multipart.rs` 距
+  `MR-STRUCT-007` 的 800 行 ERROR 阈值只剩 252 行时，任一仓的任意改动都可能卡住元仓库的全部 PR。
+  属**纯搬移**（行多重集比对确认零代码行丢失：仅旧的行恰为提级的 5 条签名），
+  145 项测试与 doctest 结果不变。
+  另：该文件的 `MR-ORG-004`（函数长度启发式）仍提示 `put_object_multipart` 为 106 行 > 100；
+  它是**启发式**提示、非必须整改项，且消除它需要改动该状态机的函数体（不是纯搬移），
+  故本次不动。
+
 ## [0.1.2] - 2026-09-22
 
 ### 变更
