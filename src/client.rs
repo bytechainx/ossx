@@ -1,16 +1,13 @@
 //! 生产 [`OssClient`]：`reqwest` + OSS Signature V1 + multipart 状态机 + 有界重试。
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
-use chrono::Utc;
-use reqwest::header::{
-    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, DATE, ETAG,
-};
+use bytes::Bytes;
+use reqwest::header::ETAG;
 use reqwest::{Client, Method, StatusCode};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, Instant};
@@ -20,10 +17,7 @@ use crate::config::OssConfig;
 use crate::error::{OssError, OssResult};
 use crate::presign::{self, PresignOptions};
 use crate::retry::{default_retry_config, with_retry_deadline, RetryConfig};
-use crate::sign::{
-    authorization_header, canonicalized_resource, canonicalized_resource_with_subresources,
-    sign_v1, split_parts,
-};
+use crate::sign::{canonicalized_resource, canonicalized_resource_with_subresources, split_parts};
 use crate::types::{ObjectMeta, OssHealth};
 
 /// 阿里云 OSS multipart 最小非末片大小（100 KiB）。
@@ -176,262 +170,20 @@ impl fmt::Debug for OssClient {
     }
 }
 
-// ── 内部辅助（crate 内共享，供 pool 复用） ───────────────────────────────────
+// `src/client.rs` 下沉后，`pub(crate)` 辅助经此转出，保持以下两处路径不变：
+//   - 各子模块（`client/*.rs`）的 `use super::*`
+//   - `src/pool.rs` 的 `use crate::client::{…}` 显式导入列表
+pub(crate) use self::endpoint::{normalize_key, object_url, virtual_host_base};
+pub(crate) use self::http::{
+    header_value, map_network, map_status, object_meta_from_headers, read_limited_body,
+    signed_headers, status_error,
+};
+pub(crate) use self::xml::{
+    build_complete_xml, parse_upload_id, validate_complete_parts, validate_etag,
+    validate_part_number, validate_upload_id,
+};
 
-/// 构造虚拟主机 base URL：`https://{bucket}.{endpoint_host}/`。
-///
-/// OSS 只支持虚拟主机风格访问，因此 `endpoint` 的 host 必须是可加前缀的**域名**；
-/// IP 端点（如 `http://127.0.0.1:9000`）会被拒绝——WHATWG URL 规范不接受末尾为数字的域名。
-/// 本地联调请使用 `*.localhost`（多数系统解析到回环地址）。
-pub(crate) fn virtual_host_base(endpoint: &str, bucket: &str) -> OssResult<Url> {
-    let mut parsed = Url::parse(endpoint.trim_end_matches('/'))
-        .map_err(|error| OssError::Config(format!("oss endpoint URL 非法: {error}")))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| OssError::Config("oss endpoint 缺少 host".into()))?
-        .to_string();
-    let virtual_host = format!("{bucket}.{host}");
-    parsed.set_host(Some(&virtual_host)).map_err(|_| {
-        OssError::Config(format!(
-            "oss virtual host URL 非法：endpoint host `{host}` 无法承载 bucket 前缀（IP 端点不支持 OSS 虚拟主机风格，本地联调请用 *.localhost）"
-        ))
-    })?;
-    parsed.set_path("/");
-    Ok(parsed)
-}
-
-/// 按 key 逐段拼接对象 URL（保留 key 内的 `/`）。
-pub(crate) fn object_url(base: &Url, key: &str) -> OssResult<Url> {
-    let mut url = base.clone();
-    {
-        let mut segments = url
-            .path_segments_mut()
-            .map_err(|_| OssError::Config("oss base URL 不能作为 path base".into()))?;
-        segments.clear();
-        for part in key.split('/') {
-            if !part.is_empty() {
-                segments.push(part);
-            }
-        }
-    }
-    Ok(url)
-}
-
-/// key 归一化与校验：去首尾空白与前导 `/`，拒绝空、`..` 与超长。
-pub(crate) fn normalize_key(key: &str) -> OssResult<String> {
-    let normalized = key.trim().trim_start_matches('/');
-    if normalized.is_empty() {
-        return Err(OssError::Config("object key 不得为空".into()));
-    }
-    if normalized.contains("..") {
-        return Err(OssError::Config("object key 不得包含 '..'".into()));
-    }
-    if normalized.len() > MAX_OBJECT_KEY_BYTES {
-        return Err(OssError::Config(format!(
-            "object key 超过 {MAX_OBJECT_KEY_BYTES} 字节上限"
-        )));
-    }
-    Ok(normalized.to_string())
-}
-
-/// 当前 GMT 时间（RFC 1123），OSS V1 `Date` 头格式。
-pub(crate) fn gmt_now() -> String {
-    Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
-}
-
-/// 由字符串构造 header 值。
-pub(crate) fn header_value(value: &str) -> OssResult<HeaderValue> {
-    HeaderValue::from_str(value)
-        .map_err(|error| OssError::Config(format!("oss header value 非法: {error}")))
-}
-
-/// 若启用 SSE-S3，则写入 `x-oss-server-side-encryption` 头并返回参与签名的
-/// CanonicalizedOSSHeaders；未启用且无 STS token 时返回空串。
-///
-/// 注意：`x-oss-*` 头必须参与 V1 签名，否则服务端重算签名会 403。
-pub(crate) fn apply_oss_headers(
-    headers: &mut HeaderMap,
-    sse: bool,
-    security_token: Option<&str>,
-) -> OssResult<String> {
-    let mut pairs: Vec<(&'static str, String)> = Vec::new();
-    if sse {
-        pairs.push((SSE_HEADER_NAME, SSE_HEADER_VALUE.to_string()));
-    }
-    if let Some(token) = security_token {
-        pairs.push((SECURITY_TOKEN_HEADER, token.to_string()));
-    }
-    // CanonicalizedOSSHeaders 要求按小写头名字典序，每行以 `\n` 结尾
-    pairs.sort_by(|left, right| left.0.cmp(right.0));
-    let mut canonicalized = String::new();
-    for (name, value) in pairs {
-        headers.insert(HeaderName::from_static(name), header_value(&value)?);
-        canonicalized.push_str(name);
-        canonicalized.push(':');
-        canonicalized.push_str(&value);
-        canonicalized.push('\n');
-    }
-    Ok(canonicalized)
-}
-
-/// 组装并签名一次 OSS 请求头：`Date` + `x-oss-*` + `Authorization`。
-///
-/// 所有请求路径都走这里，保证「签名内容」与「实际发送的头」不可能脱节。
-pub(crate) fn signed_headers(
-    access_key_id: &str,
-    access_key_secret: &str,
-    security_token: Option<&str>,
-    verb: &str,
-    content_type: &str,
-    resource: &str,
-    sse: bool,
-) -> OssResult<HeaderMap> {
-    let date = gmt_now();
-    let mut headers = HeaderMap::new();
-    headers.insert(DATE, header_value(&date)?);
-    if !content_type.is_empty() {
-        headers.insert(CONTENT_TYPE, header_value(content_type)?);
-    }
-    let canonicalized_oss_headers = apply_oss_headers(&mut headers, sse, security_token)?;
-    let signature = sign_v1(
-        access_key_secret,
-        verb,
-        "",
-        content_type,
-        &date,
-        &canonicalized_oss_headers,
-        resource,
-    );
-    let authorization = authorization_header(access_key_id, &signature);
-    headers.insert(AUTHORIZATION, header_value(&authorization)?);
-    Ok(headers)
-}
-
-/// 由响应头解析对象元数据。
-pub(crate) fn object_meta_from_headers(headers: &HeaderMap) -> ObjectMeta {
-    ObjectMeta {
-        size: headers
-            .get("content-length")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0),
-        etag: headers
-            .get("etag")
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.trim_matches('"').to_string()),
-        version_id: headers
-            .get("x-oss-version-id")
-            .and_then(|value| value.to_str().ok())
-            .map(String::from),
-        checksum: headers
-            .get("x-oss-hash-crc64ecma")
-            .and_then(|value| value.to_str().ok())
-            .map(String::from),
-        content_type: headers
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .map(String::from),
-    }
-}
-
-/// 成功直接返回；失败读取有界错误体并映射为分类错误。
-pub(crate) async fn map_status(
-    op: &str,
-    key: &str,
-    status: StatusCode,
-    response: reqwest::Response,
-    max_error_body_bytes: usize,
-) -> OssResult<()> {
-    if status.is_success() {
-        return Ok(());
-    }
-    let body = read_limited_body(response, max_error_body_bytes, "OSS error body").await?;
-    Err(status_error(
-        op,
-        key,
-        status,
-        &String::from_utf8_lossy(&body),
-    ))
-}
-
-/// 有界读取响应体：`Content-Length` 与流式累计都不得超过 `limit`。
-pub(crate) async fn read_limited_body(
-    mut response: reqwest::Response,
-    limit: usize,
-    label: &str,
-) -> OssResult<Bytes> {
-    if let Some(length) = response.content_length() {
-        let length = usize::try_from(length)
-            .map_err(|_| OssError::Config(format!("oss {label} Content-Length 超出平台范围")))?;
-        if length > limit {
-            return Err(OssError::Config(format!(
-                "oss {label} 大小 {length} 超过上限 {limit}"
-            )));
-        }
-    }
-    let mut body = BytesMut::with_capacity(limit.min(READ_BUFFER_FLOOR));
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| OssError::Connection(format!("oss {label} 读取失败: {error}")))?
-    {
-        append_limited(&mut body, &chunk, limit, label)?;
-    }
-    Ok(body.freeze())
-}
-
-fn append_limited(body: &mut BytesMut, chunk: &[u8], limit: usize, label: &str) -> OssResult<()> {
-    let next_len = body
-        .len()
-        .checked_add(chunk.len())
-        .ok_or_else(|| OssError::Config(format!("oss {label} 大小溢出")))?;
-    if next_len > limit {
-        return Err(OssError::Config(format!(
-            "oss {label} 流式读取超过上限 {limit}"
-        )));
-    }
-    body.extend_from_slice(chunk);
-    Ok(())
-}
-
-/// 网络错误映射：超时 → [`OssError::Timeout`]，其余视为可重试的 [`OssError::Connection`]。
-pub(crate) fn map_network(op: &str, error: &reqwest::Error) -> OssError {
-    if error.is_timeout() {
-        return OssError::Timeout(format!("oss {op} 请求超时: {error}"));
-    }
-    OssError::Connection(format!("oss {op} 网络失败: {error}"))
-}
-
-/// HTTP 状态映射：
-/// - 401/403 → 鉴权降级（[`OssError::Backend`]，永不可重试）
-/// - 404 → 远端不存在
-/// - 5xx → 瞬时不可用（[`OssError::Connection`]，可重试）
-/// - 其余 4xx → 远端协议错误
-pub(crate) fn status_error(op: &str, key: &str, status: StatusCode, body: &str) -> OssError {
-    // 截断响应，避免日志爆炸；不回显凭据
-    let snippet: String = body.chars().take(ERROR_SNIPPET_CHARS).collect();
-    if status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED {
-        return OssError::Backend(format!(
-            "oss {op} auth/forbidden status={status} key={key} body={snippet}"
-        ));
-    }
-    if status == StatusCode::NOT_FOUND {
-        return OssError::Backend(format!("oss {op} not found key={key}"));
-    }
-    if status.is_server_error() {
-        return OssError::Connection(format!(
-            "oss {op} server status={status} key={key} body={snippet}"
-        ));
-    }
-    if status.is_client_error() {
-        return OssError::Backend(format!(
-            "oss {op} client status={status} key={key} body={snippet}"
-        ));
-    }
-    OssError::Backend(format!(
-        "oss {op} failed status={status} key={key} body={snippet}"
-    ))
-}
+// ── 分页解析与 multipart 计划 / 孤儿风险辅助（crate 内共享） ──────────────────
 
 /// ListObjects V2 单页结果。
 struct ListPage {
@@ -495,102 +247,6 @@ fn parse_list_result(bytes: &[u8]) -> OssResult<ListPage> {
         next_token,
         truncated,
     })
-}
-
-/// 从 InitiateMultipartUploadResult XML 中提取并校验 UploadId。
-pub(crate) fn parse_upload_id(xml: &str) -> OssResult<String> {
-    const OPEN: &str = "<UploadId>";
-    const CLOSE: &str = "</UploadId>";
-    let start = xml
-        .find(OPEN)
-        .map(|index| index + OPEN.len())
-        .ok_or_else(|| OssError::Serialization("InitiateMultipart 响应缺 UploadId".into()))?;
-    let end = xml[start..]
-        .find(CLOSE)
-        .map(|index| index + start)
-        .ok_or_else(|| OssError::Serialization("InitiateMultipart UploadId 未闭合".into()))?;
-    let upload_id = xml[start..end].trim();
-    validate_upload_id(upload_id)?;
-    Ok(upload_id.to_owned())
-}
-
-/// 构造 CompleteMultipartUpload XML（含 XML 转义与分片校验）。
-pub(crate) fn build_complete_xml(parts: &[(u32, String)]) -> OssResult<String> {
-    validate_complete_parts(parts)?;
-    let mut xml = String::from("<CompleteMultipartUpload>");
-    for (number, etag) in parts {
-        xml.push_str("<Part><PartNumber>");
-        xml.push_str(&number.to_string());
-        xml.push_str("</PartNumber><ETag>");
-        xml.push_str(&escape_xml_text(etag));
-        xml.push_str("</ETag></Part>");
-    }
-    xml.push_str("</CompleteMultipartUpload>");
-    Ok(xml)
-}
-
-fn escape_xml_text(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&apos;"),
-            _ => escaped.push(character),
-        }
-    }
-    escaped
-}
-
-pub(crate) fn validate_upload_id(upload_id: &str) -> OssResult<()> {
-    if upload_id.is_empty()
-        || upload_id.len() > MAX_UPLOAD_ID_BYTES
-        || upload_id.chars().any(|character| {
-            character.is_control() || matches!(character, '<' | '>' | '&' | '"' | '\'')
-        })
-    {
-        return Err(OssError::Config(
-            "multipart upload_id 非法或超过上限".into(),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_etag(etag: &str) -> OssResult<()> {
-    if etag.is_empty() || etag.len() > MAX_ETAG_BYTES || etag.chars().any(char::is_control) {
-        return Err(OssError::Config("multipart ETag 非法或超过上限".into()));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_part_number(part_number: u32) -> OssResult<()> {
-    if part_number == 0 || part_number > MAX_PART_NUMBER {
-        return Err(OssError::Config(format!(
-            "multipart part_number 必须在 1..={MAX_PART_NUMBER} 范围内"
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_complete_parts(parts: &[(u32, String)]) -> OssResult<()> {
-    if parts.is_empty() || parts.len() > MAX_MULTIPART_PARTS {
-        return Err(OssError::Config(format!(
-            "complete_multipart part 数必须在 1..={MAX_MULTIPART_PARTS} 范围内"
-        )));
-    }
-    let mut seen = HashSet::with_capacity(parts.len());
-    for (part_number, etag) in parts {
-        validate_part_number(*part_number)?;
-        validate_etag(etag)?;
-        if !seen.insert(*part_number) {
-            return Err(OssError::Config(format!(
-                "complete_multipart 含重复 part_number={part_number}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// 校验 multipart 计划并返回分片数。
@@ -662,13 +318,23 @@ fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+mod endpoint;
+mod http;
 mod lifecycle;
 mod multipart;
 mod object;
+mod xml;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 仅测试用到的项写在测试模块内（避免非测试构建 unused import）。
+    use bytes::BytesMut;
+    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, DATE};
+
+    use crate::sign::sign_v1;
+
+    use super::http::{append_limited, apply_oss_headers};
 
     #[test]
     fn virtual_host_builds() {

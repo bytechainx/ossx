@@ -17,11 +17,26 @@
 ```text
 src/
 ├── lib.rs        # 入口：模块声明 + 受控 re-export + 公开 API 面测试
-├── client.rs     # OssClient 数据面：对象读写 / multipart / ping / health_check
-├── config.rs     # OssConfig 配置结构体 + builder + env/toml 加载 + 校验
+├── client.rs     # OssClient 门面：类型定义（OssClient / Inner / MultipartOrphanAudit）、
+│                 # 分页解析、multipart 计划与孤儿风险辅助、内联测试
+├── client/
+│   ├── endpoint.rs  # 虚拟主机端点 URL 与对象 key 辅助
+│   ├── http.rs      # 请求头组装与 V1 签名、有界响应读取、错误映射
+│   ├── lifecycle.rs # 关闭 / 健康检查 / 探活
+│   ├── multipart.rs # 分片上传状态机
+│   ├── object.rs    # 对象读写 / 列表 / 流式传输
+│   └── xml.rs       # OSS XML 解析构造与 multipart 字段校验
+├── config.rs     # OssConfig 门面：ENV_*/HARD_MAX_* 常量、定义与 Default/Debug、
+│                 # from_env/from_toml/validate/builder、validate_limit 等校验辅助、内联测试
+├── config/
+│   ├── builder.rs  # OssConfigBuilder（链式覆盖）
+│   ├── envvars.rs  # 环境变量读取与环境变量覆盖
+│   └── tomlfile.rs # TOML 形态、凭据键拒绝与 [oss] 节转换
 ├── credential.rs # CredentialProvider / StaticCredentialProvider 凭据轮换
 ├── error.rs      # OssError / OssResult
 ├── pool.rs       # OssPool 连接池 + OssPoolStats / OssHealth
+├── pool/
+│   └── ops.rs    # 连接池数据面实现
 ├── presign.rs    # presign_url / PresignOptions 预签名 URL
 ├── retry.rs      # RetryConfig / with_retry 重试策略
 ├── sign.rs       # sign_v1 / authorization_header / canonicalized_resource 签名原语
