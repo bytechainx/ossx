@@ -8,6 +8,8 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-22
+
 ### 修正
 
 - 测试（本地一次性 HTTP 桩服务）：绑定地址改为**跟随 `localhost` 的解析结果**
@@ -21,6 +23,26 @@
   数据面入口由本地一次性 TCP 服务驱动）、`tests/sdd_spec.rs`（与 `docs/标准.md` 章节 1:1
   的规格断言）、`tests/aidd_boundary.rs`（凭据脱敏 / 明文 HTTP / 对象键 / 资源上界 /
   鉴权降级等对抗用例）；均为离线用例，不依赖真实 OSS，也不引入 `#[ignore]`。
+
+### 变更
+
+- **内部结构改写（公开 API 与可观察契约均不变）**：按 `docs/module-rules.md` §5.5 的手法，把
+  `src/client.rs` 与 `src/config.rs` 两处超长门面下沉为子模块 ——
+  客户端：端点与对象 key 辅助 → `src/client/endpoint.rs`、请求头组装/签名/有界响应读取/
+  错误映射 → `src/client/http.rs`、XML 解析与 multipart 字段校验 → `src/client/xml.rs`；
+  配置：链式构建器 → `src/config/builder.rs`、环境变量读取与覆盖 → `src/config/envvars.rs`、
+  TOML 形态与凭据键拒绝 → `src/config/tomlfile.rs`。两个门面只保留模块文档、类型定义、
+  与 multipart 生命周期/孤儿风险相关的辅助，以及**原有内联测试**。
+  `OssConfigBuilder` 经门面 `pub use` 导出，公开路径不变；`pub(crate)` 辅助经门面
+  `pub(crate) use` 转出，故 `src/pool.rs` 的显式导入列表与 `src/client/*.rs` 的
+  `use super::*` **一行未改**。**可见性调整仅限 crate 内部**（`pub(super)`）。
+  `src/client.rs` 生产段 **668 → 327**、`src/config.rs` 生产段 **679 → 364**。
+  动机：`module-rules` 是元仓库必需检查，且它审计各仓**默认分支**，故当两处距
+  `MR-STRUCT-007` 的 800 行 ERROR 阈值只剩 132 / 121 行时，任一仓的任意改动都可能卡住
+  元仓库的全部 PR。属**纯搬移**（行多重集比对确认零代码行丢失），全部 145 项测试与
+  doctest 结果不变。
+  两处模块名刻意避开同名遮蔽：`endpoint.rs`（不叫 `url.rs`，避免遮蔽 `url` crate）、
+  `envvars.rs` / `tomlfile.rs`（不叫 `env.rs` / `toml.rs`，避免遮蔽 `std::env` 与 `toml` crate）。
 
 ## [0.1.0] - 2026-09-21
 
