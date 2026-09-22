@@ -8,6 +8,17 @@
 
 ## [Unreleased]
 
+### 修正
+
+- `put_object_multipart` 分片失败后 abort 自身的错误不再被静默丢弃：改为
+  `tracing::error!` 记录（含 `key` / `upload_id` / 错误详情），确保运维侧可
+  感知 OSS 残留未完成分片的风险。原始分片错误仍按原路径传播，不因 abort 失败而改变。
+
+### 新增
+
+- `tests/multipart_flow.rs`：`part_failure_when_abort_also_fails_still_returns_original_error`
+  —— abort 自己也失败时，验证返回的是原始分片错误（不被 abort 错误掩盖）。
+
 ## [0.1.4] - 2026-09-22
 
 ### 新增

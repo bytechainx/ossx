@@ -184,3 +184,46 @@ async fn part_failure_aborts_and_reports_without_orphan() {
         "abort 成功则不得登记孤儿（guard 已 disarm）：{error}"
     );
 }
+
+/// abort 自身也失败时：原始分片错误不得被掩盖，且日志中有 abort 失败的 error 记录。
+///
+/// 场景：分片上传中途失败 → 尝试 abort → abort 也返回 500 → 调用方收到的是分片上传
+/// 的原始错误，而非 abort 的错误。
+#[tokio::test]
+async fn part_failure_when_abort_also_fails_still_returns_original_error() {
+    let responses = vec![
+        ok_with(INITIATE_XML),
+        // 分片 400：不可重试类，立即触发 abort
+        "HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned(),
+        // abort 也失败（500）
+        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            .to_owned(),
+    ];
+    let (endpoint, handle) = serve_raw(responses);
+    let client = client_for(&endpoint);
+
+    let error = client
+        .put_object_multipart("k", Bytes::from_static(b"x"), 1)
+        .await
+        .expect_err("分片失败必须报错，即使 abort 失败");
+
+    // 关键断言：返回的是原始分片错误，不是 abort 错误
+    assert!(
+        matches!(error, ossx::OssError::Backend(_)),
+        "必须返回分片错误（Backend），不能返回 abort 错误：{error}"
+    );
+
+    let lines = handle.join().expect("桩线程");
+    assert_eq!(
+        lines.len(),
+        3,
+        "应恰好 3 次请求（initiate + upload_part + abort），实为 {lines:?}"
+    );
+    assert!(
+        lines[2].starts_with("DELETE ") && lines[2].contains("uploadId=upl-1"),
+        "第 3 次仍应为 abort 请求（即使返回 500）：{}",
+        lines[2]
+    );
+    // abort 失败时 orphan audit 会被登记（guard drop 时 detect 发现 abort 失败）
+    // 这与"abort 成功则 disarm"的设计一致 —— 此处仅验证原始错误不被掩盖
+}

@@ -268,7 +268,14 @@ impl OssPool {
                 Err(error) => {
                     // abort 是补偿动作：失败也不掩盖原始错误
                     let _permit = self.acquire().await.ok();
-                    let _ = self.abort_mp_once(&key, &upload_id).await;
+                    if let Err(abort_err) = self.abort_mp_once(&key, &upload_id).await {
+                        tracing::error!(
+                            key = %key,
+                            upload_id = %upload_id,
+                            error = %abort_err,
+                            "multipart abort 失败，OSS 可能残留未完成的分片上传（会产生存储费用）"
+                        );
+                    }
                     return Err(error);
                 }
             }
