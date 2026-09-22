@@ -7,7 +7,6 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
@@ -18,12 +17,12 @@ use tokio::time;
 use crate::client::{
     build_complete_xml, map_network, normalize_key, object_meta_from_headers, object_url,
     parse_upload_id, read_limited_body, signed_headers, status_error, validate_upload_id,
-    virtual_host_base, MAX_MULTIPART_PARTS, MAX_MULTIPART_PART_BYTES, MIN_MULTIPART_PART_BYTES,
+    MAX_MULTIPART_PARTS, MAX_MULTIPART_PART_BYTES, MIN_MULTIPART_PART_BYTES,
 };
 use crate::config::OssConfig;
-use crate::credential::{CredentialProvider, OssCredentials, StaticCredentialProvider};
+use crate::credential::{CredentialProvider, OssCredentials};
 use crate::error::{OssError, OssResult};
-use crate::retry::{self, default_retry_config, RetryConfig};
+use crate::retry::{self, RetryConfig};
 use crate::sign;
 use crate::types::{ByteStream, DownloadOptions, ObjectMeta, UploadOptions};
 
@@ -112,200 +111,6 @@ impl std::fmt::Debug for OssPool {
 }
 
 impl OssPool {
-    /// 同步构造：只做配置校验与连接池预热，不发起网络请求。
-    pub fn new(config: OssConfig) -> OssResult<Self> {
-        Self::new_with_retry(config, default_retry_config(), None)
-    }
-
-    /// 按配置建立连接池（异步入口，语义同 [`OssPool::new`]）。
-    pub async fn connect(config: OssConfig) -> OssResult<Self> {
-        Self::new(config)
-    }
-
-    /// 同步构造并使用自定义重试配置。
-    pub fn new_with_retry(
-        config: OssConfig,
-        retry: RetryConfig,
-        credential_provider: Option<Arc<dyn CredentialProvider>>,
-    ) -> OssResult<Self> {
-        config.validate()?;
-        retry.validate()?;
-        let provider = match credential_provider {
-            Some(provider) => provider,
-            None => Arc::new(StaticCredentialProvider::new(
-                config.access_key_id.clone(),
-                config.access_key_secret(),
-                config.security_token().map(str::to_owned),
-            )),
-        };
-        let base = virtual_host_base(&config.endpoint, &config.bucket)?;
-        let max_in_flight = config.max_in_flight;
-        let http = Client::builder()
-            .timeout(config.request_timeout)
-            .pool_max_idle_per_host(max_in_flight)
-            .user_agent(concat!("ossx/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|error| OssError::Connection(format!("oss http client 构建失败: {error}")))?;
-        Ok(Self {
-            inner: Arc::new(PoolInner {
-                http,
-                config,
-                base,
-                closed: AtomicBool::new(false),
-                permits: Arc::new(Semaphore::new(max_in_flight)),
-                retry,
-                credential_provider: provider,
-                puts_ok: AtomicU64::new(0),
-                puts_err: AtomicU64::new(0),
-                gets_ok: AtomicU64::new(0),
-                gets_err: AtomicU64::new(0),
-                deletes_ok: AtomicU64::new(0),
-                deletes_err: AtomicU64::new(0),
-                timeouts: AtomicU64::new(0),
-                cancelled: AtomicU64::new(0),
-            }),
-        })
-    }
-
-    /// 异步构造并使用自定义重试配置与凭据提供者。
-    pub async fn connect_with_retry(config: OssConfig, retry: RetryConfig) -> OssResult<Self> {
-        Self::new_with_retry(config, retry, None)
-    }
-
-    /// 异步构造并注入自定义凭据提供者（用于 STS / 自建凭据服务）。
-    pub async fn connect_with_provider(
-        config: OssConfig,
-        retry: RetryConfig,
-        credential_provider: Arc<dyn CredentialProvider>,
-    ) -> OssResult<Self> {
-        Self::new_with_retry(config, retry, Some(credential_provider))
-    }
-
-    /// 从 `FOUNDATIONX_OSSX_*` 环境变量构造。
-    pub fn from_env() -> OssResult<Self> {
-        Self::new(OssConfig::from_env()?)
-    }
-
-    /// 配置只读视图。
-    #[must_use]
-    pub fn config(&self) -> &OssConfig {
-        &self.inner.config
-    }
-
-    /// 当前重试配置。
-    #[must_use]
-    pub fn retry_config(&self) -> RetryConfig {
-        self.inner.retry
-    }
-
-    /// 凭据提供者名称（不含凭据）。
-    #[must_use]
-    pub fn provider_name(&self) -> &'static str {
-        self.inner.credential_provider.provider_name()
-    }
-
-    /// 统计快照。
-    #[must_use]
-    pub fn stats(&self) -> OssPoolStats {
-        let inner = &self.inner;
-        OssPoolStats {
-            closed: inner.closed.load(Ordering::SeqCst),
-            in_flight: inner
-                .config
-                .max_in_flight
-                .saturating_sub(inner.permits.available_permits()),
-            max_in_flight: inner.config.max_in_flight,
-            puts_ok: inner.puts_ok.load(Ordering::Relaxed),
-            puts_err: inner.puts_err.load(Ordering::Relaxed),
-            gets_ok: inner.gets_ok.load(Ordering::Relaxed),
-            gets_err: inner.gets_err.load(Ordering::Relaxed),
-            deletes_ok: inner.deletes_ok.load(Ordering::Relaxed),
-            deletes_err: inner.deletes_err.load(Ordering::Relaxed),
-            timeouts: inner.timeouts.load(Ordering::Relaxed),
-            cancelled: inner.cancelled.load(Ordering::Relaxed),
-        }
-    }
-
-    /// 关闭连接池（幂等）；关闭后所有数据面操作立即失败。
-    pub fn close(&self) {
-        self.inner.closed.store(true, Ordering::SeqCst);
-        self.inner.permits.close();
-    }
-
-    /// 健康检查：HEAD bucket 成功返回 `Ok(())`。
-    pub async fn ping(&self) -> OssResult<()> {
-        self.ensure_open()?;
-        let credentials = self.credentials().await?;
-        let resource = sign::canonicalized_resource(&self.inner.config.bucket, "");
-        let headers = signed_headers(
-            &credentials.access_key_id,
-            &credentials.access_key_secret,
-            credentials.security_token.as_deref(),
-            "HEAD",
-            "",
-            &resource,
-            self.inner.config.sse_enabled,
-        )?;
-        let mut url = self.inner.base.clone();
-        url.set_path("/");
-        let response = self
-            .inner
-            .http
-            .request(Method::HEAD, url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(|error| map_network("HEAD bucket", &error))?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
-        }
-        let body = read_limited_body(
-            response,
-            self.inner.config.max_error_body_bytes,
-            "HEAD bucket",
-        )
-        .await?;
-        Err(status_error(
-            "HEAD bucket",
-            "/",
-            status,
-            &String::from_utf8_lossy(&body),
-        ))
-    }
-
-    /// 健康检查（按 `operation_deadline` 限时）：返回结构化结果。
-    pub async fn health_check(&self) -> OssResult<OssHealth> {
-        self.health(self.inner.config.operation_deadline).await
-    }
-
-    /// 健康检查（显式 deadline）。
-    ///
-    /// 远端不可达/无权限返回 `ready = false` 的结构化结果；
-    /// 只有本地生命周期拒绝（池已关闭）才返回 `Err`。
-    pub async fn health(&self, deadline: Duration) -> OssResult<OssHealth> {
-        let started = std::time::Instant::now();
-        let outcome = time::timeout(deadline, self.ping()).await;
-        let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        match outcome {
-            Ok(Ok(())) => Ok(OssHealth {
-                ready: true,
-                bucket_accessible: true,
-                latency_ms,
-                detail: format!(
-                    "{} bucket={}",
-                    self.inner.config.endpoint, self.inner.config.bucket
-                ),
-            }),
-            Ok(Err(error)) if matches!(error, OssError::Unsupported(_)) => Err(error),
-            Ok(Err(error)) => Ok(OssHealth::unreachable(latency_ms, error.to_string())),
-            Err(_) => Ok(OssHealth::unreachable(
-                latency_ms,
-                format!("探活超过 deadline {}ms", deadline.as_millis()),
-            )),
-        }
-    }
-
     /// 上传对象（整体驻留内存，含重试）。
     #[tracing::instrument(skip(self, key, data))]
     pub async fn put_object(&self, key: impl Into<String>, data: Bytes) -> OssResult<()> {
@@ -634,11 +439,18 @@ fn empty_stream() -> ByteStream {
     Box::pin(futures_util::stream::empty::<OssResult<Bytes>>())
 }
 
+mod health;
+mod lifecycle;
 mod ops;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 仅测试用到的项写在测试模块内（避免非测试构建 unused import）。
+    use std::time::Duration;
+
+    use crate::client::virtual_host_base;
+    use crate::retry::default_retry_config;
 
     fn test_config() -> OssConfig {
         OssConfig::builder()

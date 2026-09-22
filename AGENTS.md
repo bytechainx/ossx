@@ -34,9 +34,12 @@ src/
 │   └── tomlfile.rs # TOML 形态、凭据键拒绝与 [oss] 节转换
 ├── credential.rs # CredentialProvider / StaticCredentialProvider 凭据轮换
 ├── error.rs      # OssError / OssResult
-├── pool.rs       # OssPool 连接池 + OssPoolStats / OssHealth
+├── pool.rs       # OssPool 门面：OssPoolStats / OssPool 定义与 Debug、数据面六方法、
+│                 # 内部辅助（ensure_open / acquire / credentials / validate_size / record）、内联测试
 ├── pool/
-│   └── ops.rs    # 连接池数据面实现
+│   ├── health.rs    # 探活：ping / health_check / health
+│   ├── lifecycle.rs # 构造与建连、配置/统计只读视图、close
+│   └── ops.rs       # 连接池数据面实现
 ├── presign.rs    # presign_url / PresignOptions 预签名 URL
 ├── retry.rs      # RetryConfig / with_retry 重试策略
 ├── sign.rs       # sign_v1 / authorization_header / canonicalized_resource 签名原语

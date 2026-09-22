@@ -8,6 +8,23 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-22
+
+### 变更
+
+- **内部结构改写（公开 API 与可观察契约均不变）**：按 `docs/module-rules.md` §5.5 的手法，把
+  `src/pool.rs` 的两块职责下沉为子模块 —— 构造 / 建连 / 只读观测 / 关闭 →
+  `src/pool/lifecycle.rs`、探活三方法（`ping` / `health_check` / `health`）→ `src/pool/health.rs`。
+  门面 `src/pool.rs` 保留模块文档、`DEFAULT_STREAM_PART_BYTES`、`OssPoolStats`、
+  `PoolInner` / `OssPool` 定义与 `Debug`、数据面六方法（`put_object` / `get_object` /
+  `delete_object` / `head` / `put_stream` / `get_stream`）、内部辅助
+  （`ensure_open` / `acquire` / `credentials` / `validate_size` / `record`）、`empty_stream`
+  与**原有内联测试**。搬走的 14 个方法**全部是 `pub`**，故**无需任何可见性调整**。
+  `src/pool.rs` 生产段 **638 → 445** 行。
+  动机：`module-rules` 是元仓库必需检查，且它审计各仓**默认分支**，故当 `pool.rs` 生产段距
+  `MR-STRUCT-007` 的 800 行 ERROR 阈值只剩 162 行时，任一仓的任意改动都可能卡住元仓库的全部 PR。
+  属**纯搬移**（行多重集比对确认零代码行丢失），全部 145 项测试与 doctest 结果不变。
+
 ## [0.1.1] - 2026-09-22
 
 ### 修正
