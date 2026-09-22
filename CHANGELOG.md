@@ -8,6 +8,33 @@
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-22
+
+### 新增
+
+- `tests/multipart_flow.rs`：`put_object_multipart` 的**端到端行为契约**（本地脚本化 HTTP 桩，
+  离线、不依赖真实 OSS），断言**请求序列**与返回值 —— 成功路径
+  `POST ?uploads` → `PUT ?partNumber=1` → `POST ?uploadId=…` 且不留下孤儿审计；
+  分片 400 时 `DELETE ?uploadId=…`（abort）且 abort 成功不登记孤儿。
+  补这条的背景：该入口此前**零测试覆盖**，「全绿」不构成对本次结构改写的验证。
+  验收方式：两棵树各跑一次（结果一致）+ 变异探测（让分片循环一次都不执行 ⇒ 两条用例同时红）。
+
+### 变更
+
+- **内部结构改写（公开 API 与可观察契约均不变）**：把 `put_object_multipart` 的**函数体**
+  从 106 行降到 55 行，以满足 `MR-ORG-004`（**启发式**函数体行数 > 100 提示，见
+  `docs/module-rules.md` §6.7）。抽出的两个私有方法：
+  - `upload_all_parts`（分片循环，返回 `(part_number, etag)` 列表）；
+  - `finish_multipart`（提交 `CompleteMultipartUpload` 并按 abort 语义收口）。
+
+  编排函数保留参数校验、分片切分、initiate 与孤儿审计 guard 的建立 / `disarm`。
+  **搬走的代码块逐字保留**：`upload_all_parts` 与 `finish_multipart` 的循环体 / 提交体与
+  原函数中的对应块**行数相同（40 ↔ 40、30 ↔ 30）**，差异仅为参数形态变化引出的机械替换
+  （`&upload_id` → `upload_id`、`&mut audit_guard` → `audit_guard`，共 8 处）——
+  即**零逻辑改动**。错误处理次序与 `?` 的传播点全部保持原样（含 `part_number` 溢出**不**走
+  cleanup 这一点）。
+  版本按 `docs/versioning.md` §5「内部改写 → PATCH」升 `0.1.3 → 0.1.4`。
+
 ## [0.1.3] - 2026-09-22
 
 ### 变更

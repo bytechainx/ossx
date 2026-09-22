@@ -62,6 +62,41 @@ impl OssClient {
             }
         };
         let mut audit_guard = MultipartAuditGuard::new(self, key, &upload_id);
+        let completed = self
+            .upload_all_parts(
+                key,
+                &upload_id,
+                &chunks,
+                started,
+                total_deadline,
+                &mut audit_guard,
+            )
+            .await?;
+        self.finish_multipart(
+            key,
+            &upload_id,
+            completed,
+            started,
+            total_deadline,
+            &mut audit_guard,
+        )
+        .await?;
+        audit_guard.disarm();
+        Ok(())
+    }
+
+    /// 逐个上传分片；任一分片失败（含预算耗尽）时按 abort 语义收口，返回收口后的错误。
+    ///
+    /// 返回值是 `(part_number, etag)` 列表，交给 [`OssClient::finish_multipart`] 提交。
+    async fn upload_all_parts(
+        &self,
+        key: &str,
+        upload_id: &str,
+        chunks: &[&[u8]],
+        started: Instant,
+        total_deadline: Duration,
+        audit_guard: &mut MultipartAuditGuard,
+    ) -> OssResult<Vec<(u32, String)>> {
         let mut completed: Vec<(u32, String)> = Vec::with_capacity(chunks.len());
         for (index, chunk) in chunks.iter().enumerate() {
             let part_number = u32::try_from(index + 1)
@@ -74,17 +109,17 @@ impl OssClient {
                     return Err(self
                         .cleanup_multipart_failure(
                             key,
-                            &upload_id,
+                            upload_id,
                             error,
                             started,
                             total_deadline,
-                            &mut audit_guard,
+                            audit_guard,
                         )
                         .await);
                 }
             };
             match self
-                .upload_part_with_deadline(key, &upload_id, part_number, part_data, remaining)
+                .upload_part_with_deadline(key, upload_id, part_number, part_data, remaining)
                 .await
             {
                 Ok(etag) => completed.push((part_number, etag)),
@@ -92,47 +127,59 @@ impl OssClient {
                     return Err(self
                         .cleanup_multipart_failure(
                             key,
-                            &upload_id,
+                            upload_id,
                             error,
                             started,
                             total_deadline,
-                            &mut audit_guard,
+                            audit_guard,
                         )
                         .await);
                 }
             }
         }
+        Ok(completed)
+    }
+
+    /// 提交已完成的分片列表；预算不足或提交失败时按 abort 语义收口。
+    async fn finish_multipart(
+        &self,
+        key: &str,
+        upload_id: &str,
+        completed: Vec<(u32, String)>,
+        started: Instant,
+        total_deadline: Duration,
+        audit_guard: &mut MultipartAuditGuard,
+    ) -> OssResult<()> {
         let remaining = match remaining_deadline(started, total_deadline, "multipart complete") {
             Ok(value) => value,
             Err(error) => {
                 return Err(self
                     .cleanup_multipart_failure(
                         key,
-                        &upload_id,
+                        upload_id,
                         error,
                         started,
                         total_deadline,
-                        &mut audit_guard,
+                        audit_guard,
                     )
                     .await);
             }
         };
         if let Err(error) = self
-            .complete_multipart_with_deadline(key, &upload_id, completed, remaining)
+            .complete_multipart_with_deadline(key, upload_id, completed, remaining)
             .await
         {
             return Err(self
                 .cleanup_multipart_failure(
                     key,
-                    &upload_id,
+                    upload_id,
                     error,
                     started,
                     total_deadline,
-                    &mut audit_guard,
+                    audit_guard,
                 )
                 .await);
         }
-        audit_guard.disarm();
         Ok(())
     }
 
