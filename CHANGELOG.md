@@ -16,6 +16,8 @@
 
 ### 新增
 
+- `tests/e2e_oss.rs`：离线 fail-closed E2E 与 `#[ignore]` 真连往返（不替代 `live_oss`）。
+
 - `tests/multipart_flow.rs`：`part_failure_when_abort_also_fails_still_returns_original_error`
   —— abort 自己也失败时，验证返回的是原始分片错误（不被 abort 错误掩盖）。
 
