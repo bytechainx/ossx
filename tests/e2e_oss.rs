@@ -23,14 +23,13 @@ use ossx::{
     authorization_header, byte_stream_from_bytes, canonicalized_resource,
     canonicalized_resource_with_subresources, default_retry_config, is_oss_retryable, presign_url,
     sign_v1, split_parts, with_retry, with_retry_deadline, with_retry_default, CredentialProvider,
-    DownloadOptions, ObjectKey, ObjectMeta, OssClient, OssConfig, OssError, OssPool,
-    OssPoolStats, PresignOptions, RetryConfig, StaticCredentialProvider, UploadOptions,
-    ENV_ACCESS_KEY_ID, ENV_ACCESS_KEY_SECRET, ENV_ACQUIRE_TIMEOUT_MS, ENV_BUCKET, ENV_ENDPOINT,
-    ENV_MAX_BUFFER_BYTES, ENV_MAX_ERROR_BODY_BYTES, ENV_MAX_IN_FLIGHT, ENV_MAX_OBJECT_BYTES,
-    ENV_OPERATION_DEADLINE_MS, ENV_REGION, ENV_REQUEST_TIMEOUT_MS, HARD_MAX_BUFFER_BYTES,
-    HARD_MAX_ERROR_BODY_BYTES, HARD_MAX_IN_FLIGHT, HARD_MAX_OBJECT_BYTES, MAX_MULTIPART_PARTS,
-    MAX_MULTIPART_PART_BYTES, MAX_OBJECT_KEY_BYTES, MAX_RETRY_ATTEMPTS, MIN_MULTIPART_PART_BYTES,
-    ORPHAN_AUDIT_CAPACITY,
+    DownloadOptions, ObjectKey, ObjectMeta, OssClient, OssConfig, OssError, OssPool, OssPoolStats,
+    PresignOptions, RetryConfig, StaticCredentialProvider, UploadOptions, ENV_ACCESS_KEY_ID,
+    ENV_ACCESS_KEY_SECRET, ENV_ACQUIRE_TIMEOUT_MS, ENV_BUCKET, ENV_ENDPOINT, ENV_MAX_BUFFER_BYTES,
+    ENV_MAX_ERROR_BODY_BYTES, ENV_MAX_IN_FLIGHT, ENV_MAX_OBJECT_BYTES, ENV_OPERATION_DEADLINE_MS,
+    ENV_REGION, ENV_REQUEST_TIMEOUT_MS, HARD_MAX_BUFFER_BYTES, HARD_MAX_ERROR_BODY_BYTES,
+    HARD_MAX_IN_FLIGHT, HARD_MAX_OBJECT_BYTES, MAX_MULTIPART_PARTS, MAX_MULTIPART_PART_BYTES,
+    MAX_OBJECT_KEY_BYTES, MAX_RETRY_ATTEMPTS, MIN_MULTIPART_PART_BYTES, ORPHAN_AUDIT_CAPACITY,
 };
 
 const E2E_MANIFEST: &[(&str, &str)] = &[
@@ -117,15 +116,10 @@ mod cover {
 
     pub fn hit(kind: &'static str, id: &'static str) {
         assert!(
-            E2E_MANIFEST
-                .iter()
-                .any(|(k, i)| *k == kind && *i == id),
+            E2E_MANIFEST.iter().any(|(k, i)| *k == kind && *i == id),
             "登记了清单外的公开条目：{kind} {id}"
         );
-        log()
-            .as_mut()
-            .expect("先 reset")
-            .insert((kind, id));
+        log().as_mut().expect("先 reset").insert((kind, id));
     }
 
     pub fn executed() -> BTreeSet<(&'static str, &'static str)> {
@@ -209,12 +203,18 @@ async fn e2e_oss_offline_fail_closed() {
         (ENV_ACCESS_KEY_ID, "FOUNDATIONX_OSSX_ACCESS_KEY_ID"),
         (ENV_ACCESS_KEY_SECRET, "FOUNDATIONX_OSSX_ACCESS_KEY_SECRET"),
         (ENV_REGION, "FOUNDATIONX_OSSX_REGION"),
-        (ENV_REQUEST_TIMEOUT_MS, "FOUNDATIONX_OSSX_REQUEST_TIMEOUT_MS"),
+        (
+            ENV_REQUEST_TIMEOUT_MS,
+            "FOUNDATIONX_OSSX_REQUEST_TIMEOUT_MS",
+        ),
         (
             ENV_OPERATION_DEADLINE_MS,
             "FOUNDATIONX_OSSX_OPERATION_DEADLINE_MS",
         ),
-        (ENV_ACQUIRE_TIMEOUT_MS, "FOUNDATIONX_OSSX_ACQUIRE_TIMEOUT_MS"),
+        (
+            ENV_ACQUIRE_TIMEOUT_MS,
+            "FOUNDATIONX_OSSX_ACQUIRE_TIMEOUT_MS",
+        ),
         (ENV_MAX_IN_FLIGHT, "FOUNDATIONX_OSSX_MAX_IN_FLIGHT"),
         (ENV_MAX_OBJECT_BYTES, "FOUNDATIONX_OSSX_MAX_OBJECT_BYTES"),
         (ENV_MAX_BUFFER_BYTES, "FOUNDATIONX_OSSX_MAX_BUFFER_BYTES"),
@@ -318,7 +318,9 @@ operation_deadline_ms = 4000
     hit("type", "OssClient");
     let client = OssClient::new(config.clone()).expect("new 不联网");
     hit("fn", "OssClient::new");
-    let connected = OssClient::connect(config.clone()).await.expect("connect 不打桶");
+    let connected = OssClient::connect(config.clone())
+        .await
+        .expect("connect 不打桶");
     hit("fn", "OssClient::connect");
     assert!(client.ping().await.is_err());
     hit("fn", "OssClient::ping");
@@ -358,8 +360,10 @@ operation_deadline_ms = 4000
     hit("fn", "sign_v1");
     assert!(authorization_header("id", &sig).starts_with("OSS id:"));
     hit("fn", "authorization_header");
-    assert!(canonicalized_resource_with_subresources("b", "k", &[("uploads", None)])
-        .contains("uploads"));
+    assert!(
+        canonicalized_resource_with_subresources("b", "k", &[("uploads", None)])
+            .contains("uploads")
+    );
     hit("fn", "canonicalized_resource_with_subresources");
     assert_eq!(split_parts(b"abc", 2).len(), 2);
     hit("fn", "split_parts");
