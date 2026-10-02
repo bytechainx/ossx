@@ -8,8 +8,11 @@
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-10-02
+
 ### 修正
 
+- 移除 `ByteStream` 构造函数重复的 `must_use` 属性，保留返回类型的使用约束。
 - `put_object_multipart` 分片失败后 abort 自身的错误不再被静默丢弃：改为
   `tracing::error!` 记录（含 `key` / `upload_id` / 错误详情），确保运维侧可
   感知 OSS 残留未完成分片的风险。原始分片错误仍按原路径传播，不因 abort 失败而改变。

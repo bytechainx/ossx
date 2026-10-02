@@ -109,7 +109,6 @@ impl ObjectMeta {
 pub type ByteStream = Pin<Box<dyn Stream<Item = OssResult<Bytes>> + Send>>;
 
 /// 由内存字节构造单元素 [`ByteStream`]。
-#[must_use]
 pub fn byte_stream_from_bytes(data: Bytes) -> ByteStream {
     Box::pin(futures_util::stream::once(async move { Ok(data) }))
 }
