@@ -20,6 +20,8 @@ impl OssClient {
         config.validate()?;
         retry.validate()?;
         let http = Client::builder()
+            // 签名与批准目标绑定；重定向必须交由调用方重新审定。
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(config.request_timeout)
             .pool_max_idle_per_host(config.max_in_flight)
             .user_agent(concat!("ossx/", env!("CARGO_PKG_VERSION")))

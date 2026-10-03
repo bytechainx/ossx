@@ -453,6 +453,35 @@ mod ops;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn http_pool_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("本机监听");
+        let address = listener.local_addr().expect("本机地址");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("接受连接");
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                assert!(request.len() < 4096, "请求头必须有界");
+                request.push(stream.read_u8().await.expect("读取请求"));
+            }
+            stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /other-key\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.expect("返回重定向");
+        });
+        let pool = test_pool();
+        let response = pool
+            .inner
+            .http
+            .get(format!("http://{address}/original-key"))
+            .send()
+            .await
+            .expect("收到原始响应");
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(response.url().path(), "/original-key");
+        server.await.expect("服务完成");
+    }
+
     // 仅测试用到的项写在测试模块内（避免非测试构建 unused import）。
     use std::time::Duration;
 
