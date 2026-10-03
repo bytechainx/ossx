@@ -9,7 +9,7 @@
 //! 全部用例 `#[ignore]`，默认不跑（CI 行为不变）。显式运行：
 //!
 //! ```bash
-//! set -a; source /home/zone/workspace/sre/secrets/env/ossx.env; set +a
+//! set -a; source /home/workspace/bytechainx/.config/ossx.env; set +a
 //! CARGO_TARGET_DIR=/home/workspace/bytechainx/.cargo/target \
 //!   cargo test --test live_oss -- --ignored --test-threads=1
 //! ```
