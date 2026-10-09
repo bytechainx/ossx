@@ -37,6 +37,31 @@ cargo package --no-verify --allow-dirty
 cargo bench --bench hot_path -- --quick
 ```
 
+## 本机前置：`*.localhost` 必须可解析
+
+本 crate 用 OSS **虚拟主机风格寻址**（`{bucket}.{host}`），故离线测试起的本地 HTTP 桩
+要求 `{bucket}.localhost` 这类主机名**可解析**。`src/client/endpoint.rs` 的错误消息已注明
+「IP 端点不支持 OSS 虚拟主机风格，本地联调请用 `*.localhost`」。
+
+部分解析器（如 glibc + `/etc/nsswitch.conf` 的 `files` 优先、无 systemd-resolved 时）
+**不**按 RFC 6761 把 `*.localhost` 解析到回环，导致 `cargo test` 在
+`tests/multipart_flow.rs` / `aidd_boundary.rs` / `config_env.rs` / `tdd_contracts.rs` 等
+用例上报「连接失败」且桩收不到请求。
+
+**修复**：在 `/etc/hosts` 补测试用到的 bucket 名（`bucket.localhost` 已有先例）：
+
+```text
+127.0.0.1 b.localhost
+127.0.0.1 bucket.localhost
+127.0.0.1 demo-bucket.localhost
+127.0.0.1 e2e-bucket.localhost
+127.0.0.1 unreachable-bucket.localhost
+127.0.0.1 example-bucket.localhost
+```
+
+验证：`getent hosts demo-bucket.localhost` 应有输出。CI（GitHub-hosted）按 RFC 6761
+解析 `*.localhost`，故无此前置。
+
 ## 复用口径（不发布 crates.io）
 
 - 本 crate **不发布到 crates.io**，仅以 GitHub 源码 / git 依赖形式复用。
