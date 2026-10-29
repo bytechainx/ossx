@@ -124,6 +124,22 @@ pub struct UploadOptions {
     pub part_size: usize,
     /// 是否启用 SSE-S3 服务端加密。
     pub sse_enabled: bool,
+    /// 写侧覆盖保护：`true` 时发送 `x-oss-forbid-overwrite: true`，同名对象已存在则
+    /// 服务端返回 `409 FileAlreadyExists`。
+    ///
+    /// OSS 的 PutObject **不支持** `If-Match`／`If-None-Match` 等条件头（服务端返回
+    /// `NotImplemented`），本字段是唯一的写侧覆盖保护；在开启或暂停版本控制的 Bucket 上
+    /// 该头同样不生效（官方语义，允许覆盖）。
+    pub forbid_overwrite: bool,
+}
+
+/// 单次 `PUT` 的回执。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PutObjectOutput {
+    /// 响应 `ETag`（去引号后的裸值）。
+    pub etag: Option<String>,
+    /// `x-oss-version-id`；仅版本控制开启的 Bucket 返回，暂停时为 `null`。
+    pub version_id: Option<String>,
 }
 
 /// 下载选项。
@@ -215,6 +231,7 @@ mod tests {
             metadata: Some(vec![("k".into(), "v".into())]),
             part_size: 1024,
             sse_enabled: true,
+            forbid_overwrite: false,
         };
         assert!(upload.sse_enabled);
         assert_eq!(upload.part_size, 1024);

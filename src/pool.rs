@@ -16,15 +16,16 @@ use tokio::time;
 
 use crate::client::{
     build_complete_xml, map_network, normalize_key, object_meta_from_headers, object_url,
-    parse_upload_id, read_limited_body, signed_headers, status_error, validate_upload_id,
-    MAX_MULTIPART_PARTS, MAX_MULTIPART_PART_BYTES, MIN_MULTIPART_PART_BYTES,
+    parse_upload_id, put_output_from_headers, read_limited_body, signed_headers,
+    signed_headers_with, status_error, validate_upload_id, MAX_MULTIPART_PARTS,
+    MAX_MULTIPART_PART_BYTES, MIN_MULTIPART_PART_BYTES,
 };
 use crate::config::OssConfig;
 use crate::credential::{CredentialProvider, OssCredentials};
 use crate::error::{OssError, OssResult};
 use crate::retry::{self, RetryConfig};
 use crate::sign;
-use crate::types::{ByteStream, DownloadOptions, ObjectMeta, UploadOptions};
+use crate::types::{ByteStream, DownloadOptions, ObjectMeta, PutObjectOutput, UploadOptions};
 
 /// `put_stream` 未显式指定 `part_size` 时的默认分片大小（5 MiB）。
 const DEFAULT_STREAM_PART_BYTES: usize = 5 * 1024 * 1024;
@@ -111,18 +112,39 @@ impl std::fmt::Debug for OssPool {
 }
 
 impl OssPool {
-    /// 上传对象（整体驻留内存，含重试）。
+    /// 上传对象（整体驻留内存，含重试）。丢弃 `ETag` 与版本回执，
+    /// 需要回执时用 [`OssPool::put_object_with`]。
     #[tracing::instrument(skip(self, key, data))]
     pub async fn put_object(&self, key: impl Into<String>, data: Bytes) -> OssResult<()> {
+        self.put_object_with(key, data, &UploadOptions::default())
+            .await
+            .map(|_| ())
+    }
+
+    /// 上传对象（整体驻留内存，含重试），应用 [`UploadOptions`] 并返回回执。
+    ///
+    /// `options.metadata` 与 `options.part_size` 在单次 `PUT` 路径上不生效；
+    /// `forbid_overwrite` 同名存在时映射为后端错误（HTTP 409）。
+    #[tracing::instrument(skip(self, key, data, options))]
+    pub async fn put_object_with(
+        &self,
+        key: impl Into<String>,
+        data: Bytes,
+        options: &UploadOptions,
+    ) -> OssResult<PutObjectOutput> {
         let key = normalize_key(&key.into())?;
         self.validate_size(data.len())?;
+        let sse = self.inner.config.sse_enabled || options.sse_enabled;
+        let content_type = options.content_type.as_deref();
+        let forbid_overwrite = options.forbid_overwrite;
         let result = retry::with_retry_deadline(
             &self.inner.retry,
             "put_object",
             self.inner.config.operation_deadline,
             || async {
                 let _permit = self.acquire().await?;
-                self.put_once(&key, &data, None, false).await
+                self.put_once(&key, &data, content_type, sse, forbid_overwrite)
+                    .await
             },
         )
         .await;
@@ -233,7 +255,7 @@ impl OssPool {
             .unwrap_or("application/octet-stream");
         if parts.len() == 1 {
             let _permit = self.acquire().await?;
-            self.put_once(&key, &parts[0], Some(content_type), opts.sse_enabled)
+            self.put_once(&key, &parts[0], Some(content_type), opts.sse_enabled, false)
                 .await?;
             return Ok(ObjectMeta::with_size(total as u64));
         }

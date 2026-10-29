@@ -18,7 +18,7 @@ use crate::error::{OssError, OssResult};
 use crate::presign::{self, PresignOptions};
 use crate::retry::{default_retry_config, with_retry_deadline, RetryConfig};
 use crate::sign::{canonicalized_resource, canonicalized_resource_with_subresources, split_parts};
-use crate::types::{ObjectMeta, OssHealth};
+use crate::types::{ObjectMeta, OssHealth, PutObjectOutput, UploadOptions};
 
 /// 阿里云 OSS multipart 最小非末片大小（100 KiB）。
 pub const MIN_MULTIPART_PART_BYTES: usize = 100 * 1024;
@@ -42,6 +42,8 @@ const READ_BUFFER_FLOOR: usize = 8 * 1024;
 
 const SSE_HEADER_NAME: &str = "x-oss-server-side-encryption";
 const SSE_HEADER_VALUE: &str = "AES256";
+/// 写侧覆盖保护头；同样必须参与 V1 签名。
+const FORBID_OVERWRITE_HEADER: &str = "x-oss-forbid-overwrite";
 /// STS 临时安全令牌头（同样必须参与 V1 签名）。
 const SECURITY_TOKEN_HEADER: &str = "x-oss-security-token";
 
@@ -175,8 +177,8 @@ impl fmt::Debug for OssClient {
 //   - `src/pool.rs` 的 `use crate::client::{…}` 显式导入列表
 pub(crate) use self::endpoint::{normalize_key, object_url, virtual_host_base};
 pub(crate) use self::http::{
-    header_value, map_network, map_status, object_meta_from_headers, read_limited_body,
-    signed_headers, status_error,
+    header_value, map_network, map_status, object_meta_from_headers, put_output_from_headers,
+    read_limited_body, signed_headers, signed_headers_with, status_error,
 };
 pub(crate) use self::xml::{
     build_complete_xml, parse_upload_id, validate_complete_parts, validate_etag,
@@ -574,22 +576,29 @@ mod tests {
     fn oss_headers_are_canonicalized_and_signed() {
         let mut none = HeaderMap::new();
         assert_eq!(
-            apply_oss_headers(&mut none, false, None).expect("empty"),
+            apply_oss_headers(&mut none, false, None, false).expect("empty"),
             ""
         );
         assert!(none.is_empty());
 
         let mut sse_only = HeaderMap::new();
         assert_eq!(
-            apply_oss_headers(&mut sse_only, true, None).expect("sse"),
+            apply_oss_headers(&mut sse_only, true, None, false).expect("sse"),
             "x-oss-server-side-encryption:AES256\n"
         );
         assert!(sse_only.contains_key("x-oss-server-side-encryption"));
 
+        // 写侧覆盖保护头也参与签名，且按字典序排在其他 x-oss-* 之前。
+        let mut forbid = HeaderMap::new();
+        assert_eq!(
+            apply_oss_headers(&mut forbid, false, None, true).expect("forbid"),
+            "x-oss-forbid-overwrite:true\n"
+        );
+
         // 多值时按头名字典序排列：security-token 在 server-side-encryption 之前
         let mut both = HeaderMap::new();
         assert_eq!(
-            apply_oss_headers(&mut both, true, Some("sts-token")).expect("both"),
+            apply_oss_headers(&mut both, true, Some("sts-token"), false).expect("both"),
             "x-oss-security-token:sts-token\nx-oss-server-side-encryption:AES256\n"
         );
         assert_eq!(

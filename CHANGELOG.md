@@ -8,11 +8,30 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-29
+
 ### 破坏性变更
 
 - MSRV 由 `1.85` 上调至 `1.88`：依赖链中的 `icu_* 2.3.0`（经 `idna_adapter`）要求
   rustc 1.88，原声明值不可满足。同时入库 `Cargo.lock` 并新增 `deny.toml`
   （供应链可重现，见组织基线 `R-SEC-009` / `R-DEP-005`）。
+- `UploadOptions` 新增公开字段 `forbid_overwrite`：以**完整字段字面量**构造该结构体的代码
+  需要补该字段（默认 `false`）。使用 `UploadOptions::default()` 加 `..` 更新的代码不受影响。
+
+### 新增
+
+- `put_object_with`（`OssClient` 与 `OssPool`）：应用 `UploadOptions` 并返回 `PutObjectOutput`
+  （响应 `ETag` 与 `x-oss-version-id`）。`put_object` 保持原签名，内部转调并丢弃回执。
+- `UploadOptions::forbid_overwrite`：为真时发送 `x-oss-forbid-overwrite: true` 禁止覆盖同名对象，
+  对象已存在时服务端返回 `409 FileAlreadyExists`。该头在开启或暂停版本控制的 Bucket 上
+  不生效（官方语义，允许覆盖）。
+- `PutObjectOutput`：公开导出，承载单次 `PUT` 的回执字段。
+
+### 说明
+
+- OSS `PutObject` **不支持** `If-Match` / `If-None-Match` / `If-Modified-Since` 等条件头
+  （服务端返回 `NotImplemented`）。本 crate 不提供这类字段，写侧覆盖保护只有
+  `x-oss-forbid-overwrite`。
 
 ## [0.1.5] - 2026-10-02
 

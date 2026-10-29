@@ -50,11 +50,12 @@ impl OssPool {
         data: &[u8],
         content_type: Option<&str>,
         sse: bool,
-    ) -> OssResult<()> {
+        forbid_overwrite: bool,
+    ) -> OssResult<PutObjectOutput> {
         let credentials = self.credentials().await?;
         let content_type = content_type.unwrap_or("application/octet-stream");
         let resource = sign::canonicalized_resource(&self.inner.config.bucket, key);
-        let headers = signed_headers(
+        let headers = signed_headers_with(
             &credentials.access_key_id,
             &credentials.access_key_secret,
             credentials.security_token.as_deref(),
@@ -62,6 +63,7 @@ impl OssPool {
             content_type,
             &resource,
             sse,
+            forbid_overwrite,
         )?;
         let url = object_url(&self.inner.base, key)?;
         let response = self
@@ -74,8 +76,9 @@ impl OssPool {
             .await
             .map_err(|error| map_network("PUT", &error))?;
         let status = response.status();
+        let output = put_output_from_headers(response.headers());
         if status.is_success() {
-            return Ok(());
+            return Ok(output);
         }
         let body = read_limited_body(
             response,

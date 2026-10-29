@@ -26,13 +26,13 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use bytes::Bytes;
 use ossx::{
     authorization_header, canonicalized_resource, is_oss_retryable, sign_v1, split_parts,
-    OssClient, OssConfig, OssError, ENV_ACCESS_KEY_ID, ENV_ACCESS_KEY_SECRET,
+    OssClient, OssConfig, OssError, UploadOptions, ENV_ACCESS_KEY_ID, ENV_ACCESS_KEY_SECRET,
     ENV_ACQUIRE_TIMEOUT_MS, ENV_BUCKET, ENV_ENDPOINT, ENV_MAX_BUFFER_BYTES,
     ENV_MAX_ERROR_BODY_BYTES, ENV_MAX_IN_FLIGHT, ENV_MAX_OBJECT_BYTES, ENV_OPERATION_DEADLINE_MS,
     ENV_REGION, ENV_REQUEST_TIMEOUT_MS, HARD_MAX_BUFFER_BYTES, HARD_MAX_IN_FLIGHT,
@@ -390,6 +390,100 @@ async fn put_object_round_trip_and_size_guard() {
         .await
         .expect_err("非法 key 必须拒绝");
     assert!(matches!(error, OssError::Config(_)), "{error:?}");
+}
+
+/// 同 [`serve`]，但可附加响应头并捕获请求原文（用于断言实际发出的头）。
+fn serve_capturing(
+    status_line: &'static str,
+    extra_headers: &'static str,
+    body: &'static str,
+    connections: usize,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("绑定本地端口失败");
+    let port = listener.local_addr().expect("读取本地地址").port();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&captured);
+    let _server = std::thread::spawn(move || {
+        for _ in 0..connections {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            sink.lock()
+                .expect("捕获锁")
+                .push(String::from_utf8_lossy(&buffer[..read]).into_owned());
+            let response = format!(
+                "{status_line}\r\ncontent-length: {}\r\n{extra_headers}connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    (format!("http://localhost:{port}"), captured)
+}
+
+/// `OssClient::put_object_with`：发送 `x-oss-forbid-overwrite`，并解析 `ETag`／`x-oss-version-id`。
+#[tokio::test]
+async fn put_object_with_sends_forbid_overwrite_and_returns_output() {
+    let (endpoint, captured) = serve_capturing(
+        "HTTP/1.1 200 OK",
+        "etag: \"abc123\"\r\nx-oss-version-id: CAEQNhiBgMDJgZCA0BYiIDc4MGZ\r\n",
+        "",
+        1,
+    );
+    let client = loopback_client(&endpoint);
+    let options = UploadOptions {
+        forbid_overwrite: true,
+        ..UploadOptions::default()
+    };
+    let output = client
+        .put_object_with("dir/object.txt", Bytes::from_static(b"payload"), &options)
+        .await
+        .expect("200 必须视为上传成功");
+    assert_eq!(output.etag.as_deref(), Some("abc123"));
+    assert_eq!(
+        output.version_id.as_deref(),
+        Some("CAEQNhiBgMDJgZCA0BYiIDc4MGZ")
+    );
+
+    let request = captured.lock().expect("捕获锁").join("\n").to_lowercase();
+    assert!(
+        request.contains("x-oss-forbid-overwrite: true"),
+        "请求未发送覆盖保护头：{request}"
+    );
+    assert!(
+        !request.contains("if-match") && !request.contains("if-none-match"),
+        "OSS PutObject 不支持条件头，不应发送：{request}"
+    );
+}
+
+/// `OssClient::put_object_with`：同名已存在时 `409 FileAlreadyExists` 映射为不可重试的后端错误。
+#[tokio::test]
+async fn put_object_with_forbid_overwrite_surfaces_409() {
+    let (endpoint, _captured) = serve_capturing(
+        "HTTP/1.1 409 Conflict",
+        "",
+        "<Error><Code>FileAlreadyExists</Code></Error>",
+        1,
+    );
+    let client = loopback_client(&endpoint);
+    let options = UploadOptions {
+        forbid_overwrite: true,
+        ..UploadOptions::default()
+    };
+    let error = client
+        .put_object_with("k", Bytes::from_static(b"v"), &options)
+        .await
+        .expect_err("409 必须失败");
+    assert!(matches!(error, OssError::Backend(_)), "{error:?}");
+    assert!(
+        format!("{error}").contains("409") && format!("{error}").contains("FileAlreadyExists"),
+        "{error}"
+    );
+    assert!(!error.is_retryable(), "409 不可重试");
 }
 
 /// `OssClient::get_object`：读取响应体；404 归类为远端错误且不可重试。
