@@ -49,6 +49,8 @@ impl OssPool {
         let base = virtual_host_base(&config.endpoint, &config.bucket)?;
         let max_in_flight = config.max_in_flight;
         let http = Client::builder()
+            // 签名与批准目标绑定；连接池与直接客户端使用相同边界。
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(config.request_timeout)
             .pool_max_idle_per_host(max_in_flight)
             .user_agent(concat!("ossx/", env!("CARGO_PKG_VERSION")))
