@@ -105,7 +105,8 @@ pub use sign::{
     sign_v1, split_parts,
 };
 pub use types::{
-    byte_stream_from_bytes, ByteStream, DownloadOptions, ObjectKey, ObjectMeta, UploadOptions,
+    byte_stream_from_bytes, ByteStream, DownloadOptions, ObjectKey, ObjectMeta, PutObjectOutput,
+    UploadOptions,
 };
 
 #[cfg(test)]

@@ -7,7 +7,7 @@
 
 ## 特性
 
-- **数据面**：`put_object` / `get_object` / `head_object` / `delete_object`（幂等）/ `list_objects`（V2 + 翻页）
+- **数据面**：`put_object` / `put_object_with`（回执 `ETag`／`x-oss-version-id`，可开 `x-oss-forbid-overwrite`）/ `get_object` / `head_object` / `delete_object`（幂等）/ `list_objects`（V2 + 翻页）
 - **分片上传**：`initiate` / `upload_part` / `complete` / `abort`，以及高层 `put_object_multipart`；
   未完成分片会进入**有界** orphan 审计队列，供受控补偿
 - **流式**：`OssPool::put_stream` / `get_stream`，下载流按 `max_object_bytes` 硬性截断

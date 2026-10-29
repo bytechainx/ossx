@@ -6,10 +6,28 @@ impl OssClient {
     /// 上传对象（含重试）。
     ///
     /// `data` 必须整体驻留内存；大于 [`OssConfig::max_buffer_bytes`] 的对象
-    /// 请改用 [`OssClient::put_object_multipart`]。
+    /// 请改用 [`OssClient::put_object_multipart`]。丢弃 `ETag` 与版本回执，
+    /// 需要回执时用 [`OssClient::put_object_with`]。
     pub async fn put_object(&self, key: &str, data: Bytes) -> OssResult<()> {
+        self.put_object_with(key, data, &UploadOptions::default())
+            .await
+            .map(|_| ())
+    }
+
+    /// 上传对象（含重试），应用 [`UploadOptions`] 并返回 `ETag` 与版本回执。
+    ///
+    /// `options.metadata` 与 `options.part_size` 在单次 `PUT` 路径上不生效
+    /// （前者仅流式/分片路径使用，后者是分片尺寸）；`content_type`
+    /// 缺省时使用 `application/octet-stream`。
+    pub async fn put_object_with(
+        &self,
+        key: &str,
+        data: Bytes,
+        options: &UploadOptions,
+    ) -> OssResult<PutObjectOutput> {
         self.validate_object_size(data.len())?;
         let key = key.to_string();
+        let options = options.clone();
         let this = self.clone();
         let retry = self.inner.retry;
         with_retry_deadline(
@@ -20,26 +38,36 @@ impl OssClient {
                 let this = this.clone();
                 let key = key.clone();
                 let data = data.clone();
-                async move { this.put_object_once(&key, data).await }
+                let options = options.clone();
+                async move { this.put_object_once(&key, data, &options).await }
             },
         )
         .await
     }
 
-    async fn put_object_once(&self, key: &str, data: Bytes) -> OssResult<()> {
+    async fn put_object_once(
+        &self,
+        key: &str,
+        data: Bytes,
+        options: &UploadOptions,
+    ) -> OssResult<PutObjectOutput> {
         let _permit = self.acquire().await?;
         let key = normalize_key(key)?;
         let config = &self.inner.config;
-        let content_type = "application/octet-stream";
+        let content_type = options
+            .content_type
+            .as_deref()
+            .unwrap_or("application/octet-stream");
         let resource = canonicalized_resource(&config.bucket, &key);
-        let headers = signed_headers(
+        let headers = signed_headers_with(
             &config.access_key_id,
             config.access_key_secret(),
             config.security_token(),
             "PUT",
             content_type,
             &resource,
-            config.sse_enabled,
+            config.sse_enabled || options.sse_enabled,
+            options.forbid_overwrite,
         )?;
 
         let url = object_url(&self.inner.base, &key)?;
@@ -53,14 +81,17 @@ impl OssClient {
             .await
             .map_err(|error| map_network("PUT", &error))?;
 
+        let status = response.status();
+        let output = put_output_from_headers(response.headers());
         map_status(
             "PUT",
             key.as_str(),
-            response.status(),
+            status,
             response,
             self.inner.config.max_error_body_bytes,
         )
-        .await
+        .await?;
+        Ok(output)
     }
 
     /// 下载对象（含重试）。

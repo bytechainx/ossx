@@ -13,8 +13,8 @@ use crate::sign::{authorization_header, sign_v1};
 use crate::types::ObjectMeta;
 
 use super::{
-    ERROR_SNIPPET_CHARS, READ_BUFFER_FLOOR, SECURITY_TOKEN_HEADER, SSE_HEADER_NAME,
-    SSE_HEADER_VALUE,
+    ERROR_SNIPPET_CHARS, FORBID_OVERWRITE_HEADER, READ_BUFFER_FLOOR, SECURITY_TOKEN_HEADER,
+    SSE_HEADER_NAME, SSE_HEADER_VALUE,
 };
 
 /// 当前 GMT 时间（RFC 1123），OSS V1 `Date` 头格式。
@@ -36,10 +36,14 @@ pub(crate) fn apply_oss_headers(
     headers: &mut HeaderMap,
     sse: bool,
     security_token: Option<&str>,
+    forbid_overwrite: bool,
 ) -> OssResult<String> {
     let mut pairs: Vec<(&'static str, String)> = Vec::new();
     if sse {
         pairs.push((SSE_HEADER_NAME, SSE_HEADER_VALUE.to_string()));
+    }
+    if forbid_overwrite {
+        pairs.push((FORBID_OVERWRITE_HEADER, "true".to_string()));
     }
     if let Some(token) = security_token {
         pairs.push((SECURITY_TOKEN_HEADER, token.to_string()));
@@ -69,13 +73,38 @@ pub(crate) fn signed_headers(
     resource: &str,
     sse: bool,
 ) -> OssResult<HeaderMap> {
+    signed_headers_with(
+        access_key_id,
+        access_key_secret,
+        security_token,
+        verb,
+        content_type,
+        resource,
+        sse,
+        false,
+    )
+}
+
+/// 同 [`signed_headers`]，额外决定是否发送写侧覆盖保护头 `x-oss-forbid-overwrite`。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn signed_headers_with(
+    access_key_id: &str,
+    access_key_secret: &str,
+    security_token: Option<&str>,
+    verb: &str,
+    content_type: &str,
+    resource: &str,
+    sse: bool,
+    forbid_overwrite: bool,
+) -> OssResult<HeaderMap> {
     let date = gmt_now();
     let mut headers = HeaderMap::new();
     headers.insert(DATE, header_value(&date)?);
     if !content_type.is_empty() {
         headers.insert(CONTENT_TYPE, header_value(content_type)?);
     }
-    let canonicalized_oss_headers = apply_oss_headers(&mut headers, sse, security_token)?;
+    let canonicalized_oss_headers =
+        apply_oss_headers(&mut headers, sse, security_token, forbid_overwrite)?;
     let signature = sign_v1(
         access_key_secret,
         verb,
@@ -88,6 +117,20 @@ pub(crate) fn signed_headers(
     let authorization = authorization_header(access_key_id, &signature);
     headers.insert(AUTHORIZATION, header_value(&authorization)?);
     Ok(headers)
+}
+
+/// 由响应头解析单次 `PUT` 的回执（`ETag` 与 `x-oss-version-id`）。
+pub(crate) fn put_output_from_headers(headers: &HeaderMap) -> crate::types::PutObjectOutput {
+    crate::types::PutObjectOutput {
+        etag: headers
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.trim_matches('"').to_string()),
+        version_id: headers
+            .get("x-oss-version-id")
+            .and_then(|value| value.to_str().ok())
+            .map(String::from),
+    }
 }
 
 /// 由响应头解析对象元数据。

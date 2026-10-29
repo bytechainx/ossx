@@ -329,9 +329,11 @@ async fn live_oss_pure_surface_config_and_credentials() {
         metadata: Some(Vec::new()),
         part_size: 1024,
         sse_enabled: true,
+        forbid_overwrite: true,
     };
     assert_eq!(upload.part_size, 1024);
     assert!(upload.sse_enabled);
+    assert!(upload.forbid_overwrite);
     let download = DownloadOptions::with_range("bytes=0-9");
     assert_eq!(download.range.as_deref(), Some("bytes=0-9"));
     assert!(download.if_match.is_none());
