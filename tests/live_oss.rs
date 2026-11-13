@@ -14,7 +14,7 @@
 //!   cargo test --test live_oss -- --ignored --test-threads=1
 //! ```
 //!
-//! ## 2026-09-23 环境状态注记（外部阻塞，非代码缺陷）
+//! ## 2026-09-23 环境状态注记（外部阻塞；2026-11-14 已解除）
 //!
 //! - 实测：阿里云账号被封禁，所有数据面请求返回 `403 UserDisable`
 //!   （`EC 0003-00000801`，`HostId=xhyper.oss-ap-northeast-1.aliyuncs.com`）；
@@ -27,6 +27,12 @@
 //! - 已绿：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` /
 //!   `cargo test`（默认非 ignore 全部通过）。**不得把这 8 个失败判为代码缺陷。**
 //! - 收口方式：恢复凭据后按本节上方那条命令重跑一次即可，无需改动用例。
+//!
+//! **2026-11-14 复测：账号已恢复，`live_oss` 10/10 通过**（`--test-threads=1`，同一命令、
+//! 用例未改语义）。上列 8 个此前不可跑的用例现已真跑。复测同时暴露
+//! `live_oss_pool_data_plane_and_stats` 的一处测试顺序缺陷：刻意探测缺失对象的
+//! `get_object` 会计入 `gets_err`，污染其后「成功路径无错误计数」的断言。本 PR 只把该
+//! 失败探测移到统计快照之后，断言与产品语义均不改。
 //!
 //! ## 真桶红线（生产桶）
 //!
@@ -1094,23 +1100,6 @@ async fn live_oss_pool_data_plane_and_stats() {
         let collected = collect_stream(&mut stream).await?;
         require!(collected.is_empty(), "304 响应的流必须为空");
 
-        // 缺失对象：get_stream / get_object 均 Err
-        require!(
-            pool.get_stream(
-                format!("{prefix}pool/missing.bin"),
-                DownloadOptions::default()
-            )
-            .await
-            .is_err(),
-            "缺失对象 get_stream 必须失败"
-        );
-        require!(
-            pool.get_object(format!("{prefix}pool/missing2.bin"))
-                .await
-                .is_err(),
-            "缺失对象 get_object 必须失败"
-        );
-
         // 计数：put_object / get_object 各 1 次；stream 与条件下载不计数
         let stats = pool.stats();
         require!(
@@ -1128,6 +1117,25 @@ async fn live_oss_pool_data_plane_and_stats() {
         require!(
             !stats.closed && stats.in_flight == 0,
             "收尾统计不符: {stats:?}"
+        );
+
+        // 缺失对象：get_stream / get_object 均 Err。
+        // 放在成功路径计数快照之后：`get_object` 的刻意失败会计入 `gets_err`，
+        // 不能污染「成功路径无错误计数」这一断言。
+        require!(
+            pool.get_stream(
+                format!("{prefix}pool/missing.bin"),
+                DownloadOptions::default()
+            )
+            .await
+            .is_err(),
+            "缺失对象 get_stream 必须失败"
+        );
+        require!(
+            pool.get_object(format!("{prefix}pool/missing2.bin"))
+                .await
+                .is_err(),
+            "缺失对象 get_object 必须失败"
         );
 
         // delete + 计数
