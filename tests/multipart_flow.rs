@@ -31,6 +31,49 @@ use std::time::Duration;
 use bytes::Bytes;
 use ossx::{OssClient, OssConfig};
 
+/// 解析客户端实际连接的主机名（`{bucket}.localhost`，虚拟主机风格）的全部地址。
+///
+/// `*.localhost` 依赖上游 DNS 的 wildcard 应答，CI 容器不保证具备（2026-11-16 GitLab
+/// CI 实测 `demo-bucket.localhost` 解析失败）；解析失败时尝试向 `/etc/hosts` 追加
+/// 回环映射（容器内通常以 root 运行）后重试，仍失败则 panic，错误信息直接指向环境前提。
+fn resolve_client_host() -> Vec<SocketAddr> {
+    const CLIENT_HOST: &str = "demo-bucket.localhost";
+    if let Ok(addrs) = (CLIENT_HOST, 0).to_socket_addrs() {
+        let mut resolved: Vec<SocketAddr> = addrs.collect();
+        resolved.sort_unstable();
+        resolved.dedup();
+        if !resolved.is_empty() {
+            return resolved;
+        }
+    }
+    register_loopback(CLIENT_HOST);
+    let mut resolved: Vec<SocketAddr> = (CLIENT_HOST, 0)
+        .to_socket_addrs()
+        .expect("demo-bucket.localhost 必须可解析（DNS wildcard 与 /etc/hosts 登记均失败）")
+        .collect();
+    resolved.sort_unstable();
+    resolved.dedup();
+    resolved
+}
+
+/// 尽力向 `/etc/hosts` 追加 `127.0.0.1 <name>`；无权限或已存在时静默跳过。
+fn register_loopback(name: &str) {
+    use std::io::Write;
+    let Ok(existing) = std::fs::read_to_string("/etc/hosts") else {
+        return;
+    };
+    if existing
+        .lines()
+        .flat_map(|line| line.split_whitespace())
+        .any(|token| token == name)
+    {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open("/etc/hosts") {
+        let _ = writeln!(file, "127.0.0.1 {name}");
+    }
+}
+
 /// 在同一端口上绑齐 `addrs` 的全部地址；个别地址上该端口被占时整体换端口重试，
 /// 避免留下「解析列表里有、但实际没监听」的地址族。
 fn bind_same_port(addrs: &[SocketAddr]) -> (Vec<TcpListener>, u16) {
@@ -68,13 +111,7 @@ fn bind_same_port(addrs: &[SocketAddr]) -> (Vec<TcpListener>, u16) {
 /// 「连上了别的用例的桩」或「目标地址未监听」的偶发失败（2026-11-16 GitLab CI 实测
 /// `demo-bucket.localhost` 连接失败、桩收 0 请求）。
 fn serve_raw(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
-    let mut resolved: Vec<SocketAddr> = ("demo-bucket.localhost", 0)
-        .to_socket_addrs()
-        .expect("demo-bucket.localhost 必须可解析")
-        .collect();
-    resolved.sort_unstable();
-    resolved.dedup();
-    assert!(!resolved.is_empty(), "demo-bucket.localhost 必须解析出地址");
+    let resolved = resolve_client_host();
     let (listeners, port) = bind_same_port(&resolved);
     for listener in &listeners {
         let _ = listener.set_nonblocking(true);
