@@ -10,6 +10,7 @@
 //! 摘要（期望值由独立实现按 OSS V1 规范计算），并在真实 loopback HTTP 上核对
 //! `Authorization` 头，确保「签名输入」与「实际发出的请求」不脱节。
 
+use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -21,6 +22,36 @@ use ossx::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+/// 虚拟主机风格端点 `{bucket}.localhost` 依赖上游 DNS wildcard 应答，CI 容器
+/// 不保证具备；解析失败时尽力向 `/etc/hosts` 追加回环映射后由调用方重试解析。
+fn register_loopback(name: &str) {
+    use std::io::Write;
+    let Ok(existing) = std::fs::read_to_string("/etc/hosts") else {
+        return;
+    };
+    if existing
+        .lines()
+        .flat_map(|line| line.split_whitespace())
+        .any(|token| token == name)
+    {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open("/etc/hosts") {
+        let _ = writeln!(file, "127.0.0.1 {name}");
+    }
+}
+
+/// 确保 `bucket.localhost` 可解析；仍失败时 panic，错误信息直接指向环境前提。
+fn ensure_bucket_localhost_resolves() {
+    const CLIENT_HOST: &str = "bucket.localhost";
+    if (CLIENT_HOST, 0).to_socket_addrs().is_err() {
+        register_loopback(CLIENT_HOST);
+    }
+    (CLIENT_HOST, 0)
+        .to_socket_addrs()
+        .expect("bucket.localhost 必须可解析（DNS wildcard 与 /etc/hosts 登记均失败）");
+}
 
 /// 固定向量 1：PUT 对象（无 x-oss-* 头）。
 const PUT_OBJECT_SIGNATURE: &str = "i2eNP/BLD/pc/CxWss90UYPvKI4=";
@@ -336,6 +367,7 @@ fn header_value(request_head: &str, name: &str) -> Option<String> {
 
 #[tokio::test]
 async fn put_object_signs_the_real_http_request() {
+    ensure_bucket_localhost_resolves();
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("绑定 loopback");

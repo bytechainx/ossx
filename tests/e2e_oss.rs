@@ -885,25 +885,86 @@ async fn phase_extended_offline(config: &OssConfig, client: &OssClient, pool: &O
 // 且会使 `scripts/verify-e2e-coverage.mjs` 的 `--include-ignored` 执行失败
 // （该核对器要求 E2E target 全绿，真连属 live 面）。
 
-/// 脚本化 HTTP 桩：按 `responses` 顺序应答，返回 endpoint 与「收到的请求行」句柄。
-/// 复用 `tests/multipart_flow.rs` 的解析/补绑逻辑（本机 `localhost` 可能给 `::1`）。
-fn serve_scripted(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
-    let resolved: Vec<SocketAddr> = ("localhost", 0)
-        .to_socket_addrs()
-        .expect("localhost 必须可解析")
-        .collect();
-    assert!(!resolved.is_empty(), "localhost 必须解析出地址");
-    let first = resolved[0];
-    let listener = TcpListener::bind(first).expect("绑定 localhost");
-    let port = listener.local_addr().expect("addr").port();
-    let mut listeners = vec![listener];
-    for addr in resolved.iter().skip(1) {
-        let mut with_port = *addr;
-        with_port.set_port(port);
-        if let Ok(extra) = TcpListener::bind(with_port) {
-            listeners.push(extra);
+/// 解析客户端实际连接的主机名（`{bucket}.localhost`，虚拟主机风格）的全部地址。
+///
+/// `*.localhost` 依赖上游 DNS 的 wildcard 应答，CI 容器不保证具备（2026-11-16 GitLab
+/// CI 实测 `demo-bucket.localhost` 解析失败）；解析失败时尝试向 `/etc/hosts` 追加
+/// 回环映射（容器内通常以 root 运行）后重试，仍失败则 panic，错误信息直接指向环境前提。
+fn resolve_client_host() -> Vec<SocketAddr> {
+    const CLIENT_HOST: &str = "demo-bucket.localhost";
+    if let Ok(addrs) = (CLIENT_HOST, 0).to_socket_addrs() {
+        let mut resolved: Vec<SocketAddr> = addrs.collect();
+        resolved.sort_unstable();
+        resolved.dedup();
+        if !resolved.is_empty() {
+            return resolved;
         }
     }
+    register_loopback(CLIENT_HOST);
+    let mut resolved: Vec<SocketAddr> = (CLIENT_HOST, 0)
+        .to_socket_addrs()
+        .expect("demo-bucket.localhost 必须可解析（DNS wildcard 与 /etc/hosts 登记均失败）")
+        .collect();
+    resolved.sort_unstable();
+    resolved.dedup();
+    resolved
+}
+
+/// 尽力向 `/etc/hosts` 追加 `127.0.0.1 <name>`；无权限或已存在时静默跳过。
+fn register_loopback(name: &str) {
+    use std::io::Write;
+    let Ok(existing) = std::fs::read_to_string("/etc/hosts") else {
+        return;
+    };
+    if existing
+        .lines()
+        .flat_map(|line| line.split_whitespace())
+        .any(|token| token == name)
+    {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open("/etc/hosts") {
+        let _ = writeln!(file, "127.0.0.1 {name}");
+    }
+}
+
+/// 在同一端口上绑齐 `addrs` 的全部地址；个别地址上该端口被占时整体换端口重试，
+/// 避免留下「解析列表里有、但实际没监听」的地址族。
+fn bind_same_port(addrs: &[SocketAddr]) -> (Vec<TcpListener>, u16) {
+    for _ in 0..32 {
+        let first =
+            TcpListener::bind(addrs[0]).unwrap_or_else(|e| panic!("绑定 {:?} 失败: {e}", addrs[0]));
+        let port = first.local_addr().expect("addr").port();
+        let mut listeners = vec![first];
+        let mut complete = true;
+        for addr in addrs.iter().skip(1) {
+            let mut with_port = *addr;
+            with_port.set_port(port);
+            match TcpListener::bind(with_port) {
+                Ok(extra) => listeners.push(extra),
+                Err(_) => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete {
+            return (listeners, port);
+        }
+    }
+    panic!("无法在同一端口绑齐 {addrs:?}");
+}
+
+/// 脚本化 HTTP 桩：按 `responses` 顺序应答，返回 endpoint 与「收到的请求行」句柄。
+/// 复用 `tests/multipart_flow.rs` 的解析/补绑逻辑（本机 `localhost` 可能给 `::1`）。
+///
+/// 桩必须绑定**客户端实际连接的主机名**（`{bucket}.localhost`，虚拟主机风格）的全部
+/// 解析地址：它与 `localhost` 的解析集可能不同（地址家族、个数），绑错集合会出现
+/// 「连上了别的用例的桩」或「目标地址未监听」的偶发失败（2026-11-16 GitLab CI 实测
+/// `demo-bucket.localhost` 连接失败、桩收 0 请求）。
+fn serve_scripted(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    let resolved = resolve_client_host();
+    let (listeners, port) = bind_same_port(&resolved);
     for listener in &listeners {
         let _ = listener.set_nonblocking(true);
     }
