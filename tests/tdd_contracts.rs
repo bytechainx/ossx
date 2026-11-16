@@ -77,6 +77,33 @@ fn base_builder() -> ossx::OssConfigBuilder {
         .access_key_secret("secret")
 }
 
+/// 在同一端口上绑齐 `addrs` 的全部地址；个别地址上该端口被占时整体换端口重试，
+/// 避免留下「解析列表里有、但实际没监听」的地址族。
+fn bind_same_port(addrs: &[SocketAddr]) -> (Vec<TcpListener>, u16) {
+    for _ in 0..32 {
+        let first =
+            TcpListener::bind(addrs[0]).unwrap_or_else(|e| panic!("绑定 {:?} 失败: {e}", addrs[0]));
+        let port = first.local_addr().expect("addr").port();
+        let mut listeners = vec![first];
+        let mut complete = true;
+        for addr in addrs.iter().skip(1) {
+            let mut with_port = *addr;
+            with_port.set_port(port);
+            match TcpListener::bind(with_port) {
+                Ok(extra) => listeners.push(extra),
+                Err(_) => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete {
+            return (listeners, port);
+        }
+    }
+    panic!("无法在同一端口绑齐 {addrs:?}");
+}
+
 /// 起一个本地一次性 HTTP 服务，最多处理 `connections` 个请求，返回 `http://localhost:<port>`。
 ///
 /// 客户端使用 OSS 虚拟主机风格（`{bucket}.{host}`），IP endpoint 会被拒绝，
@@ -86,34 +113,26 @@ fn base_builder() -> ossx::OssConfigBuilder {
 /// （`std::net::ToSocketAddrs` 走的也是它）只给出 `127.0.0.1`，两套工具不一致；
 /// 旧实现硬编码绑 `[::1]`，等于把可用性押在客户端栈的隐式回退上。
 ///
-/// 现实现：解析 `localhost` → 绑第一个地址 → 在其余地址上补绑**同一端口**（失败不致命），
-/// 并把「解析列表 / 实际绑定地址」写进 panic 消息，使失败可直接指向根因。
+/// 现实现：解析客户端实际连接的主机名 → 在**同一端口**上绑齐全部解析地址
+/// （个别地址上该端口被占时整体换端口重试），并把解析列表写进 panic 消息，
+/// 使失败可直接指向根因。
 /// 服务线程随句柄被丢弃而分离；进程退出时自然结束，不阻塞用例。
 fn serve(status_line: &'static str, body: &'static str, connections: usize) -> String {
-    let resolved: Vec<SocketAddr> = ("localhost", 0)
+    // 桩必须绑定客户端实际连接的主机名（`{bucket}.localhost`，虚拟主机风格）的全部
+    // 解析地址：它与 `localhost` 的解析集可能不同（地址家族、个数），绑错集合会出现
+    // 「连上了别的用例的桩」或「目标地址未监听」的偶发失败（2026-11-16 GitLab CI 实测）。
+    let mut resolved: Vec<SocketAddr> = ("demo-bucket.localhost", 0)
         .to_socket_addrs()
-        .expect("localhost 必须可解析（本地联调前提）")
+        .expect("demo-bucket.localhost 必须可解析（本地联调前提）")
         .collect();
+    resolved.sort_unstable();
+    resolved.dedup();
     assert!(
         !resolved.is_empty(),
-        "localhost 必须解析出至少一个地址（本地联调前提）"
+        "demo-bucket.localhost 必须解析出至少一个地址（本地联调前提）"
     );
 
-    let first = resolved[0];
-    let listener = TcpListener::bind(first)
-        .unwrap_or_else(|error| panic!("绑定 {first} 失败（解析列表：{resolved:?}）：{error}"));
-    let port = listener.local_addr().expect("读取本地地址").port();
-
-    // 其余解析地址上补绑同一端口：覆盖「客户端解析顺序与 bind 尝试顺序不一致」的情形。
-    // 失败不致命（端口可能已被占用，或该家族不可用），仅用于提高稳定性。
-    let mut listeners = vec![listener];
-    for addr in resolved.iter().skip(1) {
-        let mut with_port = *addr;
-        with_port.set_port(port);
-        if let Ok(extra) = TcpListener::bind(with_port) {
-            listeners.push(extra);
-        }
-    }
+    let (listeners, port) = bind_same_port(&resolved);
 
     for listener in listeners {
         let _server = std::thread::spawn(move || {
@@ -399,29 +418,41 @@ fn serve_capturing(
     body: &'static str,
     connections: usize,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("绑定本地端口失败");
-    let port = listener.local_addr().expect("读取本地地址").port();
+    let mut resolved: Vec<SocketAddr> = ("demo-bucket.localhost", 0)
+        .to_socket_addrs()
+        .expect("demo-bucket.localhost 必须可解析（本地联调前提）")
+        .collect();
+    resolved.sort_unstable();
+    resolved.dedup();
+    assert!(
+        !resolved.is_empty(),
+        "demo-bucket.localhost 必须解析出至少一个地址（本地联调前提）"
+    );
+    let (listeners, port) = bind_same_port(&resolved);
     let captured = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&captured);
-    let _server = std::thread::spawn(move || {
-        for _ in 0..connections {
-            let Ok((mut stream, _)) = listener.accept() else {
-                break;
-            };
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-            let mut buffer = [0_u8; 4096];
-            let read = stream.read(&mut buffer).unwrap_or(0);
-            sink.lock()
-                .expect("捕获锁")
-                .push(String::from_utf8_lossy(&buffer[..read]).into_owned());
-            let response = format!(
-                "{status_line}\r\ncontent-length: {}\r\n{extra_headers}connection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
-        }
-    });
+    for listener in listeners {
+        let sink = Arc::clone(&sink);
+        let _server = std::thread::spawn(move || {
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                sink.lock()
+                    .expect("捕获锁")
+                    .push(String::from_utf8_lossy(&buffer[..read]).into_owned());
+                let response = format!(
+                    "{status_line}\r\ncontent-length: {}\r\n{extra_headers}connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+    }
     (format!("http://localhost:{port}"), captured)
 }
 

@@ -31,27 +31,51 @@ use std::time::Duration;
 use bytes::Bytes;
 use ossx::{OssClient, OssConfig};
 
+/// 在同一端口上绑齐 `addrs` 的全部地址；个别地址上该端口被占时整体换端口重试，
+/// 避免留下「解析列表里有、但实际没监听」的地址族。
+fn bind_same_port(addrs: &[SocketAddr]) -> (Vec<TcpListener>, u16) {
+    for _ in 0..32 {
+        let first =
+            TcpListener::bind(addrs[0]).unwrap_or_else(|e| panic!("绑定 {:?} 失败: {e}", addrs[0]));
+        let port = first.local_addr().expect("addr").port();
+        let mut listeners = vec![first];
+        let mut complete = true;
+        for addr in addrs.iter().skip(1) {
+            let mut with_port = *addr;
+            with_port.set_port(port);
+            match TcpListener::bind(with_port) {
+                Ok(extra) => listeners.push(extra),
+                Err(_) => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if complete {
+            return (listeners, port);
+        }
+    }
+    panic!("无法在同一端口绑齐 {addrs:?}");
+}
+
 /// 按脚本应答的本地 HTTP 桩；返回 endpoint 与「收到的请求行」句柄。
 ///
 /// 复用 `tests/tdd_contracts.rs` 的解析/补绑逻辑（本机 `localhost` 解析可能给出 `::1`）。
 /// **有界等待**：脚本未被耗尽时按 deadline 退出，否则变异场景会**挂住**而不是变红。
+///
+/// 桩必须绑定**客户端实际连接的主机名**（`{bucket}.localhost`，虚拟主机风格）的全部
+/// 解析地址：它与 `localhost` 的解析集可能不同（地址家族、个数），绑错集合会出现
+/// 「连上了别的用例的桩」或「目标地址未监听」的偶发失败（2026-11-16 GitLab CI 实测
+/// `demo-bucket.localhost` 连接失败、桩收 0 请求）。
 fn serve_raw(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
-    let resolved: Vec<SocketAddr> = ("localhost", 0)
+    let mut resolved: Vec<SocketAddr> = ("demo-bucket.localhost", 0)
         .to_socket_addrs()
-        .expect("localhost 必须可解析")
+        .expect("demo-bucket.localhost 必须可解析")
         .collect();
-    assert!(!resolved.is_empty(), "localhost 必须解析出地址");
-    let first = resolved[0];
-    let listener = TcpListener::bind(first).unwrap_or_else(|e| panic!("绑定 {first} 失败: {e}"));
-    let port = listener.local_addr().expect("addr").port();
-    let mut listeners = vec![listener];
-    for addr in resolved.iter().skip(1) {
-        let mut with_port = *addr;
-        with_port.set_port(port);
-        if let Ok(extra) = TcpListener::bind(with_port) {
-            listeners.push(extra);
-        }
-    }
+    resolved.sort_unstable();
+    resolved.dedup();
+    assert!(!resolved.is_empty(), "demo-bucket.localhost 必须解析出地址");
+    let (listeners, port) = bind_same_port(&resolved);
     for listener in &listeners {
         let _ = listener.set_nonblocking(true);
     }
