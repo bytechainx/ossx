@@ -8,6 +8,11 @@
 
 ## [Unreleased]
 
+### 修正
+
+- `deny.toml` 新增 `RUSTSEC-2026-0543`（chrono 停维护）书面例外：本仓直接依赖，
+  上游无安全升级；消除期限 2026-12-31。修复 GitLab `main` pipeline `supply-chain` job 失败。
+
 ## [0.2.0] - 2026-10-29
 
 ### 破坏性变更
