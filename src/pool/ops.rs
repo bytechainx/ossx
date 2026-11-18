@@ -6,44 +6,6 @@
 use super::*;
 
 impl OssPool {
-    /// 读取流并按 `part_size` 聚合为内存分片。
-    pub(super) async fn collect_parts(
-        &self,
-        mut stream: ByteStream,
-        part_size: usize,
-    ) -> OssResult<Vec<Bytes>> {
-        let mut parts: Vec<Bytes> = Vec::new();
-        let mut current = BytesMut::with_capacity(part_size);
-        loop {
-            match time::timeout(self.inner.config.request_timeout, stream.next()).await {
-                Ok(Some(Ok(chunk))) => {
-                    current.extend_from_slice(&chunk);
-                    while current.len() >= part_size {
-                        parts.push(current.split_to(part_size).freeze());
-                        if parts.len() > MAX_MULTIPART_PARTS {
-                            return Err(OssError::Config(format!(
-                                "multipart 分片数超过上限 {MAX_MULTIPART_PARTS}"
-                            )));
-                        }
-                    }
-                }
-                Ok(Some(Err(error))) => return Err(error),
-                Ok(None) => {
-                    if !current.is_empty() {
-                        parts.push(current.freeze());
-                    }
-                    return Ok(parts);
-                }
-                Err(_) => {
-                    return Err(OssError::Timeout(format!(
-                        "oss put_stream 读取分片超过 request_timeout {}ms",
-                        self.inner.config.request_timeout.as_millis()
-                    )));
-                }
-            }
-        }
-    }
-
     pub(super) async fn put_once(
         &self,
         key: &str,
@@ -273,7 +235,7 @@ impl OssPool {
         key: &str,
         upload_id: &str,
         part_number: u32,
-        data: &[u8],
+        data: Bytes,
         sse: bool,
     ) -> OssResult<String> {
         validate_upload_id(upload_id)?;
@@ -306,7 +268,7 @@ impl OssPool {
             .http
             .request(Method::PUT, url)
             .headers(headers)
-            .body(data.to_vec())
+            .body(data)
             .send()
             .await
             .map_err(|error| map_network("UploadPart", &error))?;

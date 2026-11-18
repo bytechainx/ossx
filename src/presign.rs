@@ -67,6 +67,51 @@ pub fn presign_url(
     access_key_secret: &str,
     options: &PresignOptions,
 ) -> OssResult<String> {
+    presign_url_with_token(
+        endpoint,
+        bucket,
+        key,
+        access_key_id,
+        access_key_secret,
+        None,
+        options,
+    )
+}
+
+/// 生成带 STS `security-token` 的 Signature V1 预签名 URL。
+///
+/// 与 [`presign_url`] 参数一致，额外接受 `security_token`：
+/// 使用 STS 临时凭据（`AssumeRole` 签发）时必须把 token 以
+/// `security-token` query 参数带出，否则 OSS 会以 `InvalidSecurityToken`
+/// 拒绝请求。token 按 `application/x-www-form-urlencoded` 规则百分号编码。
+///
+/// ```
+/// use ossx::{presign_url_with_token, PresignOptions};
+///
+/// # fn main() -> Result<(), ossx::OssError> {
+/// let url = presign_url_with_token(
+///     "https://oss-cn-hangzhou.aliyuncs.com",
+///     "demo-bucket",
+///     "dir/object.txt",
+///     "LTAI5tExample",
+///     "secret",
+///     Some("STS.exAmPle.Token+with/slash="),
+///     &PresignOptions::default(),
+/// )?;
+/// assert!(url.contains("&security-token="));
+/// # Ok(())
+/// # }
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn presign_url_with_token(
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+    access_key_id: &str,
+    access_key_secret: &str,
+    security_token: Option<&str>,
+    options: &PresignOptions,
+) -> OssResult<String> {
     let ttl = i64::try_from(options.expires.as_secs()).unwrap_or(i64::MAX);
     let expires_at = chrono::Utc::now().timestamp().saturating_add(ttl);
     build_presign_url(
@@ -75,18 +120,21 @@ pub fn presign_url(
         key,
         access_key_id,
         access_key_secret,
+        security_token,
         options,
         expires_at,
     )
 }
 
 /// 按显式过期时间戳（epoch 秒）构造预签名 URL。
+#[allow(clippy::too_many_arguments)]
 fn build_presign_url(
     endpoint: &str,
     bucket: &str,
     key: &str,
     access_key_id: &str,
     access_key_secret: &str,
+    security_token: Option<&str>,
     options: &PresignOptions,
     expires_at: i64,
 ) -> OssResult<String> {
@@ -111,9 +159,19 @@ fn build_presign_url(
         &resource,
     );
     let encoded = signature.replace('+', "%2B").replace('/', "%2F");
-    Ok(format!(
+    let mut url = format!(
         "https://{bucket}.{host}/{key}?OSSAccessKeyId={access_key_id}&Expires={expires_at}&Signature={encoded}"
-    ))
+    );
+    if let Some(token) = security_token {
+        if token.is_empty() {
+            return Err(OssError::Config("security_token 不能为空字符串".into()));
+        }
+        let encoded_token: String =
+            url::form_urlencoded::byte_serialize(token.as_bytes()).collect();
+        url.push_str("&security-token=");
+        url.push_str(&encoded_token);
+    }
+    Ok(url)
 }
 
 #[cfg(test)]
@@ -196,6 +254,7 @@ mod tests {
             "key",
             "id",
             "sec",
+            None,
             &PresignOptions::default(),
             1_700_000_000,
         )
@@ -218,6 +277,7 @@ mod tests {
             "key",
             "id",
             "sk",
+            None,
             &PresignOptions::default(),
             1_893_456_000,
         )
@@ -254,6 +314,55 @@ mod tests {
             }
         }
         panic!("同一秒内 presign_url 必须确定性相等");
+    }
+
+    #[test]
+    fn presign_with_token_appends_encoded_security_token() {
+        let url = presign_url_with_token(
+            "https://oss.example.com",
+            "bucket",
+            "key",
+            "id",
+            "sec",
+            Some("STS.exAmPle+Token/with=chars"),
+            &PresignOptions::default(),
+        )
+        .expect("presign");
+        assert!(url.contains("&security-token="));
+        // '+' '/' '=' 必须被百分号编码，不能原样出现在 query
+        let token_part = url.split("&security-token=").nth(1).expect("token part");
+        assert!(!token_part.contains('+'));
+        assert!(!token_part.contains('/'));
+        assert!(token_part.contains("STS.exAmPle"));
+    }
+
+    #[test]
+    fn presign_with_empty_token_fails_closed() {
+        assert!(presign_url_with_token(
+            "https://oss.example.com",
+            "bucket",
+            "key",
+            "id",
+            "sec",
+            Some(""),
+            &PresignOptions::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn presign_without_token_has_no_security_token_param() {
+        let url = presign_url_with_token(
+            "https://oss.example.com",
+            "bucket",
+            "key",
+            "id",
+            "sec",
+            None,
+            &PresignOptions::default(),
+        )
+        .expect("presign");
+        assert!(!url.contains("security-token"));
     }
 
     #[test]

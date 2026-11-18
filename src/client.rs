@@ -104,6 +104,11 @@ impl fmt::Debug for MultipartOrphanAudit {
 }
 
 impl MultipartOrphanAudit {
+    /// crate 内构造（`OssPool` 流式路径复用同一审计类型）。
+    pub(crate) fn new(key: String, upload_id: String) -> Self {
+        Self { key, upload_id }
+    }
+
     /// 待清理对象 key；仅交给受控补偿流程。
     #[must_use]
     pub fn key(&self) -> &str {
@@ -175,6 +180,7 @@ impl fmt::Debug for OssClient {
 // `src/client.rs` 下沉后，`pub(crate)` 辅助经此转出，保持以下两处路径不变：
 //   - 各子模块（`client/*.rs`）的 `use super::*`
 //   - `src/pool.rs` 的 `use crate::client::{…}` 显式导入列表
+pub use self::bucket_lifecycle::{LifecycleRule, LifecycleStatus};
 pub(crate) use self::endpoint::{normalize_key, object_url, virtual_host_base};
 pub(crate) use self::http::{
     header_value, map_network, map_status, object_meta_from_headers, put_output_from_headers,
@@ -320,6 +326,7 @@ fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+mod bucket_lifecycle;
 mod endpoint;
 mod http;
 mod lifecycle;

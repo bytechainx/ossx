@@ -341,12 +341,13 @@ fn validate_forces_https_and_hard_caps() {
         .build()
         .expect("恰好等于硬上界合法");
 
-    // object 上限不得超过 buffer 上限。
-    assert!(base_builder()
+    // object 上限可大于 buffer 上限：对象总大小与单次内存缓冲相互独立，
+    // 流式路径（put_stream/get_stream）承载 TB 级对象不依赖 buffer 上界。
+    base_builder()
         .max_object_bytes(4096)
         .max_buffer_bytes(1024)
         .build()
-        .is_err());
+        .expect("object > buffer 合法");
 
     // validate() 与 build() 结论一致。
     let ok = base_builder().build().unwrap();

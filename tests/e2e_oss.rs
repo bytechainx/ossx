@@ -23,10 +23,12 @@ use bytes::Bytes;
 use ossx::{
     authorization_header, byte_stream_from_bytes, canonicalized_resource,
     canonicalized_resource_with_subresources, default_retry_config, is_oss_retryable, presign_url,
-    sign_v1, split_parts, with_retry, with_retry_deadline, with_retry_default, CredentialProvider,
-    DownloadOptions, ObjectKey, ObjectMeta, OssClient, OssConfig, OssError, OssPool, OssPoolStats,
-    PresignOptions, RetryConfig, StaticCredentialProvider, UploadOptions, ENV_ACCESS_KEY_ID,
-    ENV_ACCESS_KEY_SECRET, ENV_ACQUIRE_TIMEOUT_MS, ENV_BUCKET, ENV_ENDPOINT, ENV_MAX_BUFFER_BYTES,
+    presign_url_with_token, sign_v1, split_parts, sts_config_from_env, with_retry,
+    with_retry_deadline, with_retry_default, CredentialProvider, DownloadOptions, LifecycleRule,
+    LifecycleStatus, ObjectKey, ObjectMeta, OssClient, OssConfig, OssCredentials, OssError,
+    OssPool, OssPoolStats, PresignOptions, RetryConfig, StaticCredentialProvider, StsConfig,
+    StsCredentialProvider, UploadOptions, ENV_ACCESS_KEY_ID, ENV_ACCESS_KEY_SECRET,
+    ENV_ACQUIRE_TIMEOUT_MS, ENV_BUCKET, ENV_ENDPOINT, ENV_MAX_BUFFER_BYTES,
     ENV_MAX_ERROR_BODY_BYTES, ENV_MAX_IN_FLIGHT, ENV_MAX_OBJECT_BYTES, ENV_OPERATION_DEADLINE_MS,
     ENV_REGION, ENV_REQUEST_TIMEOUT_MS, HARD_MAX_BUFFER_BYTES, HARD_MAX_ERROR_BODY_BYTES,
     HARD_MAX_IN_FLIGHT, HARD_MAX_OBJECT_BYTES, MAX_MULTIPART_PARTS, MAX_MULTIPART_PART_BYTES,
@@ -220,6 +222,35 @@ const E2E_MANIFEST: &[(&str, &str)] = &[
     ("fn", "with_retry"),
     ("fn", "with_retry_deadline"),
     ("fn", "with_retry_default"),
+    ("fn", "presign_url_with_token"),
+    ("fn", "sts_config_from_env"),
+    ("type", "StsConfig"),
+    ("field", "StsConfig::duration_seconds"),
+    ("field", "StsConfig::endpoint"),
+    ("field", "StsConfig::refresh_skew"),
+    ("field", "StsConfig::request_timeout"),
+    ("field", "StsConfig::role_arn"),
+    ("field", "StsConfig::role_session_name"),
+    ("fn", "StsConfig::role_arn"),
+    ("fn", "StsConfig::validate"),
+    ("type", "StsCredentialProvider"),
+    ("fn", "StsCredentialProvider::new"),
+    ("fn", "StsCredentialProvider::cached_ttl_seconds"),
+    ("type", "LifecycleRule"),
+    ("field", "LifecycleRule::abort_multipart_upload_days"),
+    ("field", "LifecycleRule::expiration_days"),
+    ("field", "LifecycleRule::id"),
+    ("field", "LifecycleRule::prefix"),
+    ("field", "LifecycleRule::status"),
+    ("fn", "LifecycleRule::abort_multipart_upload"),
+    ("type", "LifecycleStatus"),
+    ("variant", "LifecycleStatus::Disabled"),
+    ("variant", "LifecycleStatus::Enabled"),
+    ("fn", "OssClient::put_bucket_lifecycle"),
+    ("fn", "OssClient::get_bucket_lifecycle"),
+    ("fn", "OssClient::delete_bucket_lifecycle"),
+    ("fn", "OssPool::multipart_orphan_audits"),
+    ("fn", "OssPool::orphan_audit_overflow_count"),
     ("type", "ByteStream"),
     ("type", "OssResult"),
 ];
@@ -876,6 +907,99 @@ async fn phase_extended_offline(config: &OssConfig, client: &OssClient, pool: &O
     let _ = pool.health(Duration::from_millis(300)).await;
     hit("fn", "OssPool::health_check");
     let _ = pool.health_check().await;
+
+    // ── 新增面：STS presign token / STS AssumeRole provider / bucket lifecycle ──
+    hit("fn", "presign_url_with_token");
+    let _ = presign_url_with_token(
+        "https://oss.example.com",
+        "b",
+        "k",
+        "id",
+        "sec",
+        Some("sts-token"),
+        &PresignOptions::default(),
+    )
+    .expect("带 token 的 presign 必须成功");
+
+    hit("fn", "sts_config_from_env");
+    let _ = sts_config_from_env();
+
+    hit("type", "StsConfig");
+    hit("field", "StsConfig::endpoint");
+    hit("field", "StsConfig::role_arn");
+    hit("field", "StsConfig::role_session_name");
+    hit("field", "StsConfig::duration_seconds");
+    hit("field", "StsConfig::refresh_skew");
+    hit("field", "StsConfig::request_timeout");
+    hit("fn", "StsConfig::role_arn");
+    hit("fn", "StsConfig::validate");
+    let mut sts = StsConfig::default().role_arn("acs:ram::123456789012:role/e2e");
+    sts.endpoint = "https://sts.example.com".into();
+    sts.role_session_name = "e2e".into();
+    sts.duration_seconds = 900;
+    sts.refresh_skew = Duration::from_secs(60);
+    sts.request_timeout = Duration::from_secs(5);
+    let _ = (
+        &sts.endpoint,
+        &sts.role_arn,
+        &sts.role_session_name,
+        sts.duration_seconds,
+        sts.refresh_skew,
+        sts.request_timeout,
+    );
+    sts.validate().expect("合法 StsConfig");
+
+    hit("type", "StsCredentialProvider");
+    hit("fn", "StsCredentialProvider::new");
+    hit("fn", "StsCredentialProvider::cached_ttl_seconds");
+    let sts_provider = StsCredentialProvider::new(
+        StsConfig::default().role_arn("acs:ram::123456789012:role/e2e"),
+        OssCredentials {
+            access_key_id: "ram-id".into(),
+            access_key_secret: "ram-secret".into(),
+            security_token: None,
+        },
+    )
+    .expect("sts provider 构造不联网");
+    assert_eq!(sts_provider.provider_name(), "sts-assume-role");
+    assert_eq!(sts_provider.cached_ttl_seconds().await, None);
+
+    hit("type", "LifecycleRule");
+    hit("field", "LifecycleRule::id");
+    hit("field", "LifecycleRule::prefix");
+    hit("field", "LifecycleRule::status");
+    hit("field", "LifecycleRule::expiration_days");
+    hit("field", "LifecycleRule::abort_multipart_upload_days");
+    hit("fn", "LifecycleRule::abort_multipart_upload");
+    hit("type", "LifecycleStatus");
+    hit("variant", "LifecycleStatus::Enabled");
+    hit("variant", "LifecycleStatus::Disabled");
+    let rule = LifecycleRule::abort_multipart_upload("abort-mp", 7);
+    let _ = (
+        &rule.id,
+        &rule.prefix,
+        rule.status,
+        rule.expiration_days,
+        rule.abort_multipart_upload_days,
+    );
+    assert_eq!(rule.status, LifecycleStatus::Enabled);
+    let disabled = LifecycleStatus::Disabled;
+    assert_ne!(disabled, LifecycleStatus::Enabled);
+
+    // bucket lifecycle 数据面在不可达端点下 fail-closed（真实调用触达函数体）
+    hit("fn", "OssClient::put_bucket_lifecycle");
+    let _ = client
+        .put_bucket_lifecycle(&[LifecycleRule::abort_multipart_upload("r", 7)])
+        .await;
+    hit("fn", "OssClient::get_bucket_lifecycle");
+    let _ = client.get_bucket_lifecycle().await;
+    hit("fn", "OssClient::delete_bucket_lifecycle");
+    let _ = client.delete_bucket_lifecycle().await;
+
+    hit("fn", "OssPool::multipart_orphan_audits");
+    let _ = pool.multipart_orphan_audits();
+    hit("fn", "OssPool::orphan_audit_overflow_count");
+    let _ = pool.orphan_audit_overflow_count();
 }
 
 // 说明：本文件**只做离线 E2E**（与 s3x 的 `e2e_s3.rs`、configx 的 `e2e_config.rs` 同构）。

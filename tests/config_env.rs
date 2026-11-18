@@ -164,13 +164,12 @@ fn validation_rejects_bad_inputs() {
     assert!(base_builder().access_key_secret(" ").build().is_err());
     assert!(base_builder().access_key_id(" ").build().is_err());
 
-    // 对象上限 > 缓冲上限
-    let error = base_builder()
+    // 对象上限 > 缓冲上限：流式路径允许，二者相互独立
+    base_builder()
         .max_object_bytes(4096)
         .max_buffer_bytes(1024)
         .build()
-        .expect_err("object > buffer");
-    assert!(error.to_string().contains("max_object_bytes"));
+        .expect("object > buffer 现在合法");
 }
 
 #[test]

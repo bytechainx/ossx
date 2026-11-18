@@ -5,8 +5,9 @@
 //! - 内置计数（成功/失败/超时/取消），可经 [`OssPool::stats`] 直接对接指标；
 //! - 提供流式上传/下载（[`OssPool::put_stream`] / [`OssPool::get_stream`]）。
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
@@ -17,8 +18,8 @@ use tokio::time;
 use crate::client::{
     build_complete_xml, map_network, normalize_key, object_meta_from_headers, object_url,
     parse_upload_id, put_output_from_headers, read_limited_body, signed_headers,
-    signed_headers_with, status_error, validate_upload_id, MAX_MULTIPART_PARTS,
-    MAX_MULTIPART_PART_BYTES, MIN_MULTIPART_PART_BYTES,
+    signed_headers_with, status_error, validate_upload_id, MultipartOrphanAudit,
+    MAX_MULTIPART_PARTS, MAX_MULTIPART_PART_BYTES, MIN_MULTIPART_PART_BYTES, ORPHAN_AUDIT_CAPACITY,
 };
 use crate::config::OssConfig;
 use crate::credential::{CredentialProvider, OssCredentials};
@@ -74,6 +75,9 @@ struct PoolInner {
     deletes_err: AtomicU64,
     timeouts: AtomicU64,
     cancelled: AtomicU64,
+    /// 流式 multipart 补偿失败后登记的孤儿分片审计（有界，超限计 overflow）。
+    orphan_audits: Mutex<VecDeque<MultipartOrphanAudit>>,
+    orphan_audit_overflow: AtomicU64,
 }
 
 /// 可克隆的 OSS 连接池。
@@ -208,9 +212,12 @@ impl OssPool {
         .await
     }
 
-    /// 流式上传：按 `opts.part_size` 切分，单片走单次 PUT，多片走 multipart。
+    /// 流式上传：分片填满即传，内存中不聚合全量分片。
     ///
-    /// - `part_size == 0` 时使用 5 MiB 默认值；
+    /// - `part_size == 0` 时使用 5 MiB 默认值；单片走单次 PUT，多片走 multipart；
+    /// - 内存占用上界为一个 `part_size` 缓冲加单个 stream chunk，与对象总大小无关，
+    ///   因此 TB 级对象不依赖 `max_buffer_bytes`；对象总大小仍受 `max_object_bytes` 约束，
+    ///   超限时若已发起 multipart 会先 `AbortMultipartUpload` 补偿再返回错误；
     /// - `opts.metadata` 当前不支持（自定义 `x-oss-meta-*` 头需要参与 V1 签名），
     ///   传入非空值会返回 [`OssError::Unsupported`]，不会静默忽略；
     /// - 分片失败会尝试 `AbortMultipartUpload`。
@@ -241,70 +248,127 @@ impl OssPool {
                 "put_stream part_size 必须在 {MIN_MULTIPART_PART_BYTES}..={MAX_MULTIPART_PART_BYTES} 范围内"
             )));
         }
-        let parts = self.collect_parts(stream, part_size).await?;
-        let total: usize = parts.iter().map(Bytes::len).sum();
-        if total > self.inner.config.max_object_bytes {
-            return Err(OssError::Config(format!(
-                "stream 对象大小 {total} 超过上限 {}",
-                self.inner.config.max_object_bytes
-            )));
-        }
         let content_type = opts
             .content_type
             .as_deref()
             .unwrap_or("application/octet-stream");
-        if parts.len() == 1 {
-            let _permit = self.acquire().await?;
-            self.put_once(&key, &parts[0], Some(content_type), opts.sse_enabled, false)
-                .await?;
-            return Ok(ObjectMeta::with_size(total as u64));
+        let max_object_bytes = self.inner.config.max_object_bytes as u64;
+        let request_timeout = self.inner.config.request_timeout;
+
+        let mut stream = stream;
+        let mut pending = BytesMut::with_capacity(part_size);
+        let mut upload_id: Option<String> = None;
+        let mut guard: Option<StreamAbortGuard> = None;
+        let mut uploaded: Vec<(u32, String)> = Vec::new();
+        let mut total: u64 = 0;
+
+        // 任一失败路径直接返回错误；已发起的 multipart 由 `StreamAbortGuard`
+        // 在 Drop 时统一补偿（spawn 异步 abort，失败写 orphan 审计）。
+        macro_rules! fail {
+            ($error:expr) => {
+                return Err($error)
+            };
         }
-        let upload_id = {
-            let _permit = self.acquire().await?;
-            self.init_mp_once(&key, opts.sse_enabled).await?
-        };
-        let mut uploaded: Vec<(u32, String)> = Vec::with_capacity(parts.len());
-        for (index, part) in parts.into_iter().enumerate() {
-            let part_number = u32::try_from(index + 1)
-                .map_err(|_| OssError::Config("multipart part_number 溢出".into()))?;
+
+        loop {
+            // 先把 pending 填到 part_size，或读到流结束。
+            let eof = loop {
+                if pending.len() >= part_size {
+                    break false;
+                }
+                match time::timeout(request_timeout, stream.next()).await {
+                    Ok(Some(Ok(chunk))) => {
+                        total = total.saturating_add(chunk.len() as u64);
+                        if total > max_object_bytes {
+                            fail!(OssError::Config(format!(
+                                "stream 对象大小超过上限 {max_object_bytes}"
+                            )));
+                        }
+                        pending.extend_from_slice(&chunk);
+                    }
+                    Ok(Some(Err(error))) => fail!(error),
+                    Ok(None) => break true,
+                    Err(_) => {
+                        fail!(OssError::Timeout(format!(
+                            "oss put_stream 读取分片超过 request_timeout {}ms",
+                            request_timeout.as_millis()
+                        )));
+                    }
+                }
+            };
+            if pending.is_empty() {
+                debug_assert!(eof, "pending 为空时只能来自流结束");
+                break;
+            }
+            let part = if eof {
+                pending.split_to(pending.len()).freeze()
+            } else {
+                pending.split_to(part_size).freeze()
+            };
+            let part_number = match u32::try_from(uploaded.len() + 1) {
+                Ok(number) if number <= MAX_MULTIPART_PARTS as u32 => number,
+                _ => fail!(OssError::Config(format!(
+                    "multipart 分片数超过上限 {MAX_MULTIPART_PARTS}"
+                ))),
+            };
+
+            // 只有「首个分片即最后一个分片」时走单次 PUT，避免无谓的 multipart 往返。
+            if upload_id.is_none() && eof {
+                let _permit = self.acquire().await?;
+                self.put_once(&key, &part, Some(content_type), opts.sse_enabled, false)
+                    .await?;
+                return Ok(ObjectMeta::with_size(total));
+            }
+            if upload_id.is_none() {
+                let _permit = self.acquire().await?;
+                let id = self.init_mp_once(&key, opts.sse_enabled).await?;
+                guard = Some(StreamAbortGuard::new(self, &key, &id));
+                upload_id = Some(id);
+            }
+            let mp_id = upload_id
+                .clone()
+                .ok_or_else(|| OssError::Backend("multipart upload_id 缺失".into()))?;
+
             let this = self.clone();
             let part_key = key.clone();
-            let part_upload_id = upload_id.clone();
             let sse = opts.sse_enabled;
             let retry = self.inner.retry;
             let deadline = self.inner.config.operation_deadline;
             let outcome = retry::with_retry_deadline(&retry, "upload_part", deadline, || {
                 let this = this.clone();
                 let part_key = part_key.clone();
-                let part_upload_id = part_upload_id.clone();
+                let part_upload_id = mp_id.clone();
                 let data = part.clone();
                 async move {
                     let _permit = this.acquire().await?;
-                    this.upload_part_once(&part_key, &part_upload_id, part_number, &data, sse)
+                    this.upload_part_once(&part_key, &part_upload_id, part_number, data, sse)
                         .await
                 }
             })
             .await;
             match outcome {
                 Ok(etag) => uploaded.push((part_number, etag)),
-                Err(error) => {
-                    // abort 是补偿动作：失败也不掩盖原始错误
-                    let _permit = self.acquire().await.ok();
-                    if let Err(abort_err) = self.abort_mp_once(&key, &upload_id).await {
-                        tracing::error!(
-                            key = %key,
-                            upload_id = %upload_id,
-                            error = %abort_err,
-                            "multipart abort 失败，OSS 可能残留未完成的分片上传（会产生存储费用）"
-                        );
-                    }
-                    return Err(error);
-                }
+                Err(error) => fail!(error),
+            }
+            if eof {
+                break;
             }
         }
+
+        // 走到这里仍无 upload_id ⟺ 流为空：按空对象单次 PUT 处理。
+        let Some(mp_id) = upload_id else {
+            let _permit = self.acquire().await?;
+            self.put_once(&key, &[], Some(content_type), opts.sse_enabled, false)
+                .await?;
+            return Ok(ObjectMeta::with_size(0));
+        };
         let _permit = self.acquire().await?;
-        self.complete_mp_once(&key, &upload_id, &uploaded).await?;
-        Ok(ObjectMeta::with_size(total as u64))
+        // complete 失败时 `?` 直接返回，guard Drop 负责 abort 补偿。
+        self.complete_mp_once(&key, &mp_id, &uploaded).await?;
+        if let Some(g) = guard.as_mut() {
+            g.disarm();
+        }
+        Ok(ObjectMeta::with_size(total))
     }
 
     /// 流式下载：返回元数据与惰性字节流。
@@ -466,6 +530,92 @@ impl OssPool {
 /// 空字节流（`304 Not Modified` 等无实体场景）。
 fn empty_stream() -> ByteStream {
     Box::pin(futures_util::stream::empty::<OssResult<Bytes>>())
+}
+
+/// `put_stream` 的 multipart 补偿守卫。
+///
+/// multipart 已发起但尚未 complete 时，任何退出路径——错误返回、future 取消、
+/// panic 展开——都会在 `Drop` 中 spawn 异步 abort；abort 失败（或当前无线程
+/// runtime 可用）时把 `(key, upload_id)` 写入有界 orphan 审计，进程退出窗口
+/// 由 bucket lifecycle `AbortIncompleteMultipartUpload` 兜底。
+struct StreamAbortGuard {
+    pool: OssPool,
+    key: String,
+    upload_id: String,
+    armed: bool,
+}
+
+impl StreamAbortGuard {
+    fn new(pool: &OssPool, key: &str, upload_id: &str) -> Self {
+        Self {
+            pool: pool.clone(),
+            key: key.to_owned(),
+            upload_id: upload_id.to_owned(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StreamAbortGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let pool = self.pool.clone();
+        let key = self.key.clone();
+        let upload_id = self.upload_id.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(abort_err) = pool.abort_stream_upload(&key, &upload_id).await {
+                        pool.push_orphan_audit(&key, &upload_id);
+                        tracing::error!(
+                            key = %key,
+                            upload_id = %upload_id,
+                            error = %abort_err,
+                            "put_stream abort 失败，OSS 可能残留未完成的分片上传（会产生存储费用）"
+                        );
+                    }
+                });
+            }
+            Err(_) => {
+                pool.push_orphan_audit(&key, &upload_id);
+                tracing::error!(
+                    key = %key,
+                    upload_id = %upload_id,
+                    "put_stream 补偿时无 runtime 可用，已登记 orphan 审计"
+                );
+            }
+        }
+    }
+}
+
+impl OssPool {
+    /// 流式路径的 abort 补偿：取并发许可后执行 DELETE ?uploadId。
+    async fn abort_stream_upload(&self, key: &str, upload_id: &str) -> OssResult<()> {
+        let _permit = self.acquire().await?;
+        self.abort_mp_once(key, upload_id).await
+    }
+
+    /// 写入有界 orphan 审计；容量满时丢弃并累计 overflow。
+    fn push_orphan_audit(&self, key: &str, upload_id: &str) {
+        let audit = MultipartOrphanAudit::new(key.to_owned(), upload_id.to_owned());
+        let mut audits = match self.inner.orphan_audits.lock() {
+            Ok(audits) => audits,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if audits.len() < ORPHAN_AUDIT_CAPACITY {
+            audits.push_back(audit);
+        } else {
+            self.inner
+                .orphan_audit_overflow
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 mod health;
@@ -682,24 +832,6 @@ mod tests {
         drop(permit);
         let _permit = pool.acquire().await.expect("permit released");
         assert_eq!(pool.stats().in_flight, 1);
-    }
-
-    #[tokio::test]
-    async fn collect_parts_splits_stream_by_part_size() {
-        let pool = test_pool();
-        let stream =
-            crate::types::byte_stream_from_bytes(Bytes::from(vec![
-                b'x';
-                MIN_MULTIPART_PART_BYTES * 2 + 1
-            ]));
-        let parts = pool
-            .collect_parts(stream, MIN_MULTIPART_PART_BYTES)
-            .await
-            .expect("parts");
-        assert_eq!(parts.len(), 3);
-        assert_eq!(parts[0].len(), MIN_MULTIPART_PART_BYTES);
-        assert_eq!(parts[1].len(), MIN_MULTIPART_PART_BYTES);
-        assert_eq!(parts[2].len(), 1);
     }
 
     #[tokio::test]

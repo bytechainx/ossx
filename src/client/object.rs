@@ -393,7 +393,7 @@ impl OssClient {
     }
 
     /// 内存读取上限：对象上限与缓冲上限的较小值。
-    fn read_limit(&self) -> usize {
+    pub(super) fn read_limit(&self) -> usize {
         self.inner
             .config
             .max_object_bytes

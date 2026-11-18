@@ -73,6 +73,8 @@ impl OssPool {
                 deletes_err: AtomicU64::new(0),
                 timeouts: AtomicU64::new(0),
                 cancelled: AtomicU64::new(0),
+                orphan_audits: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                orphan_audit_overflow: AtomicU64::new(0),
             }),
         })
     }
@@ -134,6 +136,25 @@ impl OssPool {
             timeouts: inner.timeouts.load(Ordering::Relaxed),
             cancelled: inner.cancelled.load(Ordering::Relaxed),
         }
+    }
+
+    /// 流式 multipart 补偿失败后登记的孤儿分片审计快照（有界）。
+    ///
+    /// UploadId 属运维敏感标识：只应交给受控补偿流程（如 bucket lifecycle
+    /// `AbortIncompleteMultipartUpload` 或显式 abort），禁止写入公共日志。
+    #[must_use]
+    pub fn multipart_orphan_audits(&self) -> Vec<crate::MultipartOrphanAudit> {
+        let audits = match self.inner.orphan_audits.lock() {
+            Ok(audits) => audits,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        audits.iter().cloned().collect()
+    }
+
+    /// orphan 审计因容量上限被丢弃的累计次数。
+    #[must_use]
+    pub fn orphan_audit_overflow_count(&self) -> u64 {
+        self.inner.orphan_audit_overflow.load(Ordering::Relaxed)
     }
 
     /// 关闭连接池（幂等）；关闭后所有数据面操作立即失败。
