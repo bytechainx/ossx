@@ -163,13 +163,17 @@ impl OssClient {
     }
 
     /// 生成预签名 URL（复用客户端凭据，避免调用方另行保存 secret）。
+    ///
+    /// 客户端配置了 `security_token`（STS 临时凭据）时，token 会以
+    /// `security-token` query 参数带出；未配置时行为与 [`presign_url`] 一致。
     pub fn presign_url(&self, key: &str, options: &PresignOptions) -> OssResult<String> {
-        presign::presign_url(
+        presign::presign_url_with_token(
             &self.inner.config.endpoint,
             &self.inner.config.bucket,
             key,
             &self.inner.config.access_key_id,
             self.inner.config.access_key_secret(),
+            self.inner.config.security_token(),
             options,
         )
     }

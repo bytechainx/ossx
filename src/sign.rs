@@ -37,7 +37,7 @@ fn derive_key_block(key: &[u8]) -> [u8; SHA1_BLOCK_BYTES] {
 }
 
 /// HMAC-SHA1 摘要（20 字节）。
-fn hmac_sha1(key: &[u8], msg: &[u8]) -> Vec<u8> {
+pub(crate) fn hmac_sha1(key: &[u8], msg: &[u8]) -> Vec<u8> {
     let key_block: Key<HmacSha1> = derive_key_block(key).into();
     let mut mac = <HmacSha1 as Mac>::new(&key_block);
     mac.update(msg);

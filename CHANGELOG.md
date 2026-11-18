@@ -8,6 +8,24 @@
 
 ## [Unreleased]
 
+### 新增
+
+- `presign_url_with_token`：预签名 URL 携带 STS `security-token` query 参数（form 编码，
+  空 token fail-closed）；`OssClient::presign_url` 在配置含 `security_token` 时自动带出。
+- `StsConfig` / `StsCredentialProvider` / `sts_config_from_env`：STS `AssumeRole` 凭据提供者，
+  Signature V1 签名 RPC、缓存临时凭据并在过期前按 `refresh_skew` 提前刷新；
+  环境变量前缀 `FOUNDATIONX_OSSX_STS_`（`ROLE_ARN` 必填，其余取 `StsConfig::default()`）。
+- `LifecycleRule` / `LifecycleStatus` 与 `OssClient::{put,get,delete}_bucket_lifecycle`：
+  bucket 生命周期规则管理，支持对象过期与 `AbortIncompleteMultipartUpload` 自动中止；
+  与客户端 `MultipartOrphanAudit` 互补（服务端兜底，不替代即时 abort）。
+- `OssPool::put_stream` 改为边读边传：分片填满即上传，不再聚合全量 `Vec<Bytes>`；
+  失败 / 取消 / complete 失败时执行 abort 并保留 orphan 审计。
+
+### 变更
+
+- `OssConfig::validate` 不再要求 `max_object_bytes <= max_buffer_bytes`：对象总大小上界
+  与单次内存缓冲上界相互独立，TB 级对象经流式路径承载（`max_object_bytes` 硬上界不变）。
+
 ### 修正
 
 - `deny.toml` 新增 `RUSTSEC-2026-0543`（chrono 停维护）书面例外：本仓直接依赖，

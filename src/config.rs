@@ -43,8 +43,11 @@ pub const ENV_MAX_ERROR_BODY_BYTES: &str = "FOUNDATIONX_OSSX_MAX_ERROR_BODY_BYTE
 
 /// 并发请求数硬上界。
 pub const HARD_MAX_IN_FLIGHT: usize = 1_024;
-/// 对象字节数硬上界（5 GiB，阿里云单对象上限）。
-pub const HARD_MAX_OBJECT_BYTES: usize = 5 * 1024 * 1024 * 1024;
+/// 对象字节数硬上界（48.8 TB，阿里云 OSS 单对象上限）。
+///
+/// 该上界只约束对象总大小；流式路径（`put_stream` / `get_stream`）的内存占用由
+/// `part_size` / `max_buffer_bytes` 独立约束，因此可以承载 TB 级对象。
+pub const HARD_MAX_OBJECT_BYTES: usize = 48_800_000_000_000;
 /// 单次内存缓冲硬上界（512 MiB）。
 pub const HARD_MAX_BUFFER_BYTES: usize = 512 * 1024 * 1024;
 /// 错误响应体读取硬上界（1 MiB）。
@@ -237,7 +240,7 @@ impl OssConfig {
     /// 规则：必填字段非空、endpoint 为 HTTPS（HTTP 仅允许 loopback）、
     /// endpoint 不带 userinfo/path/query/fragment、bucket 命名合法、
     /// 超时与 deadline 均为正且 `operation_deadline >= request_timeout`、
-    /// 所有上界落在 `1..=HARD_MAX_*`、`max_object_bytes <= max_buffer_bytes`。
+    /// 所有上界落在 `1..=HARD_MAX_*`；`max_object_bytes` 与 `max_buffer_bytes` 相互独立。
     pub fn validate(&self) -> OssResult<()> {
         for (name, value) in [
             ("endpoint", self.endpoint.as_str()),
@@ -300,11 +303,8 @@ impl OssConfig {
             self.max_error_body_bytes,
             HARD_MAX_ERROR_BODY_BYTES,
         )?;
-        if self.max_object_bytes > self.max_buffer_bytes {
-            return Err(OssError::Config(
-                "当前 Bytes API 要求 max_object_bytes 不得超过 max_buffer_bytes".into(),
-            ));
-        }
+        // max_object_bytes 与 max_buffer_bytes 相互独立：对象上界约束总大小，
+        // 缓冲上界约束单次内存驻留；流式路径不要求两者满足 object <= buffer。
         Ok(())
     }
 }
@@ -457,12 +457,12 @@ mod tests {
             .expect_err("empty secret");
         assert!(error.to_string().contains("access_key_secret"));
 
-        let error = full_builder()
+        // max_object_bytes 可大于 max_buffer_bytes：对象上界与缓冲上界相互独立。
+        full_builder()
             .max_object_bytes(4096)
             .max_buffer_bytes(1024)
             .build()
-            .expect_err("object > buffer");
-        assert!(error.to_string().contains("max_object_bytes"));
+            .expect("object > buffer 现在合法");
     }
 
     #[test]

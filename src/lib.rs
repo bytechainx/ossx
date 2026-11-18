@@ -80,11 +80,13 @@ mod pool;
 mod presign;
 mod retry;
 mod sign;
+mod sts;
 mod types;
 
 pub use client::{
-    MultipartOrphanAudit, OssClient, MAX_MULTIPART_PARTS, MAX_MULTIPART_PART_BYTES,
-    MAX_OBJECT_KEY_BYTES, MIN_MULTIPART_PART_BYTES, ORPHAN_AUDIT_CAPACITY,
+    LifecycleRule, LifecycleStatus, MultipartOrphanAudit, OssClient, MAX_MULTIPART_PARTS,
+    MAX_MULTIPART_PART_BYTES, MAX_OBJECT_KEY_BYTES, MIN_MULTIPART_PART_BYTES,
+    ORPHAN_AUDIT_CAPACITY,
 };
 pub use config::{
     OssConfig, OssConfigBuilder, ENV_ACCESS_KEY_ID, ENV_ACCESS_KEY_SECRET, ENV_ACQUIRE_TIMEOUT_MS,
@@ -95,7 +97,7 @@ pub use config::{
 pub use credential::{CredentialProvider, OssCredentials, StaticCredentialProvider};
 pub use error::{OssError, OssResult};
 pub use pool::{OssHealth, OssPool, OssPoolStats};
-pub use presign::{presign_url, PresignOptions};
+pub use presign::{presign_url, presign_url_with_token, PresignOptions};
 pub use retry::{
     default_retry_config, is_oss_retryable, with_retry, with_retry_deadline, with_retry_default,
     RetryConfig, MAX_RETRY_ATTEMPTS,
@@ -104,6 +106,7 @@ pub use sign::{
     authorization_header, canonicalized_resource, canonicalized_resource_with_subresources,
     sign_v1, split_parts,
 };
+pub use sts::{sts_config_from_env, StsConfig, StsCredentialProvider};
 pub use types::{
     byte_stream_from_bytes, ByteStream, DownloadOptions, ObjectKey, ObjectMeta, PutObjectOutput,
     UploadOptions,

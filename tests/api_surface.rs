@@ -53,7 +53,7 @@ fn constants_are_stable() {
     );
 
     assert_eq!(HARD_MAX_IN_FLIGHT, 1_024);
-    assert_eq!(HARD_MAX_OBJECT_BYTES, 5 * 1024 * 1024 * 1024);
+    assert_eq!(HARD_MAX_OBJECT_BYTES, 48_800_000_000_000);
     assert_eq!(HARD_MAX_BUFFER_BYTES, 512 * 1024 * 1024);
     assert_eq!(HARD_MAX_ERROR_BODY_BYTES, 1024 * 1024);
 
